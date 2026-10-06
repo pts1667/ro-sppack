@@ -5,6 +5,7 @@ mod assets;
 mod config_gen;
 mod events;
 mod jobs;
+mod log_files;
 mod settings;
 
 use events::AppEvent;

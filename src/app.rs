@@ -4,13 +4,15 @@ use crate::assets;
 use crate::config_gen;
 use crate::events::{AppEvent, LogLevel};
 use crate::jobs::{JobKind, JobRunner, kill_pid};
+use crate::log_files::LogFiles;
 use crate::settings::{AssetMode, Settings};
 
 use eframe::egui;
 use egui::{Color32, RichText};
 use std::collections::VecDeque;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -41,6 +43,8 @@ pub struct App {
     tab: Tab,
 
     logs: VecDeque<LogLine>,
+    log_files: Arc<LogFiles>,
+    log_file_error_shown: bool,
     log_filter: String,
     autoscroll: bool,
 
@@ -73,6 +77,8 @@ impl App {
             assets_dir_input,
             tab: Tab::Setup,
             logs: VecDeque::new(),
+            log_files: LogFiles::new(),
+            log_file_error_shown: false,
             log_filter: String::new(),
             autoscroll: true,
             runner: JobRunner::new(tx.clone(), ctx.clone()),
@@ -97,6 +103,16 @@ impl App {
     // -- event plumbing ----------------------------------------------------------
 
     fn push_log(&mut self, source: &str, text: String, level: LogLevel) {
+        if let Err(error) = self.log_files.write(&self.settings.install_dir, source, &text) {
+            if !self.log_file_error_shown {
+                self.log_file_error_shown = true;
+                self.push_log_line("launcher", format!("could not write log files: {error}"), LogLevel::Warn);
+            }
+        }
+        self.push_log_line(source, text, level);
+    }
+
+    fn push_log_line(&mut self, source: &str, text: String, level: LogLevel) {
         if self.logs.len() >= 5_000 {
             self.logs.pop_front();
         }
@@ -144,7 +160,7 @@ impl App {
                         }
                     }
                 }
-                AppEvent::ProcLog { name, line } => self.push_log(&name, line, LogLevel::Info),
+                AppEvent::ProcLog { name, line } => self.push_log_line(&name, line, LogLevel::Info),
                 AppEvent::ProcExited { name, code } => {
                     if name == "server" {
                         self.server_pid = None;
@@ -322,11 +338,15 @@ impl App {
                 let pid = child.id();
                 let tx = self.tx.clone();
                 let ctx = self.ctx.clone();
+                let sink = ProcessLogSink {
+                    files: self.log_files.clone(),
+                    install_dir: self.settings.install_dir.clone(),
+                };
                 if let Some(stdout) = child.stdout.take() {
-                    spawn_process_reader(stdout, name.to_string(), tx.clone(), ctx.clone());
+                    spawn_process_reader(stdout, name.to_string(), tx.clone(), ctx.clone(), sink.clone());
                 }
                 if let Some(stderr) = child.stderr.take() {
-                    spawn_process_reader(stderr, name.to_string(), tx.clone(), ctx.clone());
+                    spawn_process_reader(stderr, name.to_string(), tx.clone(), ctx.clone(), sink);
                 }
                 std::thread::spawn(move || {
                     let status = child.wait();
@@ -1125,6 +1145,7 @@ impl Drop for App {
     fn drop(&mut self) {
         self.stop_all();
         self.runner.cancel();
+        self.log_files.flush();
     }
 }
 
@@ -1206,11 +1227,19 @@ fn path_field_row(ui: &mut egui::Ui, label: &str, value: &mut String, browse: &m
     });
 }
 
+/// Process output is written to disk by the reader threads, so it is kept even while the window is not repainting.
+#[derive(Clone)]
+struct ProcessLogSink {
+    files: Arc<LogFiles>,
+    install_dir: PathBuf,
+}
+
 fn spawn_process_reader<R: std::io::Read + Send + 'static>(
     reader: R,
     name: String,
     tx: Sender<AppEvent>,
     ctx: egui::Context,
+    sink: ProcessLogSink,
 ) {
     std::thread::spawn(move || {
         use std::io::BufRead;
@@ -1218,6 +1247,7 @@ fn spawn_process_reader<R: std::io::Read + Send + 'static>(
         for line in buffered.lines() {
             match line {
                 Ok(line) => {
+                    let _ = sink.files.write(&sink.install_dir, &name, &line);
                     let _ = tx.send(AppEvent::ProcLog {
                         name: name.clone(),
                         line,

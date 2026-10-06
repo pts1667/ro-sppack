@@ -153,6 +153,10 @@ folder, auto-extraction of requested assets, `ENABLE_WSPROXY=false`.
   run.
 - **Ports in use.** Startup errors from rust-ro or the remote client appear in
   the Logs tab; change the ports in Setup and relaunch.
+- **Log files.** Everything in the Logs tab is also written to
+  `<install dir>/logs`: `server.log`, `web.log` and `launcher.log` (setup jobs
+  and launcher messages). Lines are flushed to disk about every 10 seconds, and
+  the previous run's file is kept as `<name>.previous.log`.
 
 ## Licensing
 
