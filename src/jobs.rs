@@ -41,6 +41,11 @@ pub enum JobKind {
         copy_bgm_ai: bool,
         copy_loose_data: bool,
     },
+    CopyTranslation {
+        source: PathBuf,
+        webroot: PathBuf,
+        marker: PathBuf,
+    },
     GenerateConfigs {
         settings: Settings,
     },
@@ -300,6 +305,21 @@ fn run_job(
             Ok(message)
         }
 
+        JobKind::CopyTranslation {
+            source,
+            webroot,
+            marker,
+        } => {
+            let message =
+                assets::copy_translation(job.id, source, webroot, marker, tx, ctx, cancel)?;
+            let _ = tx.send(AppEvent::JobLog {
+                id: job.id,
+                line: message.clone(),
+            });
+            ctx.request_repaint();
+            Ok(message)
+        }
+
         JobKind::GenerateConfigs { settings } => {
             let message = config_gen::generate_all(settings)?;
             let _ = tx.send(AppEvent::JobLog {
@@ -476,6 +496,18 @@ pub fn install_plan(settings: &Settings, force: bool) -> Vec<(String, JobKind)> 
         have_remote = true;
     }
 
+    let mut have_translation = settings.translation_cloned();
+    if settings.install_translation && !have_translation {
+        plan.push((
+            "Clone English translation".to_string(),
+            JobKind::GitClone {
+                url: settings.translation_repo.clone(),
+                dest: settings.translation_dir(),
+            },
+        ));
+        have_translation = true;
+    }
+
     if have_server && (force || !settings.server_built()) {
         plan.push((
             "Build rust-ro server".to_string(),
@@ -520,6 +552,19 @@ pub fn install_plan(settings: &Settings, force: bool) -> Vec<(String, JobKind)> 
                 reference: settings.asset_mode == crate::settings::AssetMode::Reference,
                 copy_bgm_ai: settings.copy_bgm_ai,
                 copy_loose_data: settings.copy_loose_data,
+            },
+        ));
+    }
+    if settings.install_translation
+        && have_translation
+        && (force || !settings.translation_applied())
+    {
+        plan.push((
+            "Apply English translation".to_string(),
+            JobKind::CopyTranslation {
+                source: settings.translation_dir(),
+                webroot: settings.webroot(),
+                marker: settings.translation_marker(),
             },
         ));
     }
@@ -589,6 +634,31 @@ mod tests {
             read_toolchain_channel(&legacy).as_deref(),
             Some("nightly-2026-01-01")
         );
+    }
+
+    #[test]
+    fn install_plan_covers_translation_only_when_enabled() {
+        let mut settings = Settings::default();
+        assert_eq!(
+            settings.translation_repo,
+            "https://github.com/zackdreaver/ROenglishPRE.git"
+        );
+
+        settings.install_translation = true;
+        let labels: Vec<String> = install_plan(&settings, false)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect();
+        assert!(labels.contains(&"Clone English translation".to_string()));
+        assert!(labels.contains(&"Apply English translation".to_string()));
+
+        settings.install_translation = false;
+        let labels: Vec<String> = install_plan(&settings, false)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect();
+        assert!(!labels.contains(&"Clone English translation".to_string()));
+        assert!(!labels.contains(&"Apply English translation".to_string()));
     }
 
     /// Requires git, cargo and Node/npm to be installed. Run with:

@@ -75,6 +75,8 @@ standalone package.
   rust-ro/                  cloned server repository (config.json is regenerated)
   roBrowserLegacy/          cloned web client repository (built into dist/Web)
   remote-client/            cloned asset server repository and its release binary
+  ROenglishPRE/             optional English translation repository
+  translation.json          marker written after the translation is applied
   webroot/                  runtime data owned by the launcher
     Config.local.js         generated client override (server address, ports, ...)
     .env                    generated remote client configuration
@@ -82,6 +84,7 @@ standalone package.
       DATA.INI              generated archive manifest
       *.grf                 copied archives (or referenced in place)
     data/                   loose overrides copied from the assets folder / auto-extracted
+    System/                 loose System/ overrides (translation, item info)
     BGM/  AI/               only present when "copy" is enabled for them
   ro-sppack.json            launcher settings (working directory)
 ```
@@ -151,6 +154,13 @@ folder, auto-extraction of requested assets, `ENABLE_WSPROXY=false`.
   whenever something changes. If no file is there yet, a settings file left
   next to the executable by older builds is copied over automatically on first
   run.
+- **English translation.** On English systems the setup enables
+  [ROenglishPRE](https://github.com/zackdreaver/ROenglishPRE) by default: the
+  repository is cloned during install and its `data/` and `System/` trees are
+  copied over the package's loose client files. Most of it is Lua table (`.lub`)
+  and name/description `.txt` content, which the asset server serves before the
+  GRFs — no archive repacking is needed. Turn it off with *Install the English
+  translation* in Setup, or re-apply after an update with **Apply into data**.
 - **Ports in use.** Startup errors from rust-ro or the remote client appear in
   the Logs tab; change the ports in Setup and relaunch.
 - **Log files.** Everything in the Logs tab is also written to

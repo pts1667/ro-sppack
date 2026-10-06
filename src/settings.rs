@@ -44,6 +44,10 @@ pub struct Settings {
     pub server_repo: String,
     pub client_repo: String,
     pub remote_client_repo: String,
+
+    /// Copy the ROenglishPRE fan translation over the client's loose data files.
+    pub install_translation: bool,
+    pub translation_repo: String,
 }
 
 impl Default for Settings {
@@ -71,6 +75,8 @@ impl Default for Settings {
             client_repo: "https://github.com/MrAntares/roBrowserLegacy.git".into(),
             remote_client_repo: "https://github.com/Flux159/roBrowserLegacy-RemoteClient-Rust.git"
                 .into(),
+            install_translation: system_language_is_english(),
+            translation_repo: "https://github.com/zackdreaver/ROenglishPRE.git".into(),
         }
     }
 }
@@ -119,6 +125,15 @@ impl Settings {
 
     pub fn remote_client_dir(&self) -> PathBuf {
         self.install_dir.join("remote-client")
+    }
+
+    pub fn translation_dir(&self) -> PathBuf {
+        self.install_dir.join("ROenglishPRE")
+    }
+
+    /// Marker written once the translation has been copied into the webroot.
+    pub fn translation_marker(&self) -> PathBuf {
+        self.install_dir.join("translation.json")
     }
 
     pub fn webroot(&self) -> PathBuf {
@@ -203,6 +218,15 @@ impl Settings {
         self.remote_client_dir().join("Cargo.toml").is_file()
     }
 
+    pub fn translation_cloned(&self) -> bool {
+        self.translation_dir().join("data").is_dir()
+    }
+
+    /// True once the translation files were copied over the webroot data.
+    pub fn translation_applied(&self) -> bool {
+        self.translation_marker().is_file()
+    }
+
     pub fn server_built(&self) -> bool {
         self.server_bin().is_file()
     }
@@ -226,4 +250,12 @@ pub fn exe_dir() -> PathBuf {
         .ok()
         .and_then(|path| path.parent().map(|parent| parent.to_path_buf()))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+/// Whether the system's preferred UI language is English. Used to decide the
+/// default for the optional data translation on brand new configurations.
+pub fn system_language_is_english() -> bool {
+    sys_locale::get_locale()
+        .map(|locale| locale.to_ascii_lowercase().starts_with("en"))
+        .unwrap_or(false)
 }

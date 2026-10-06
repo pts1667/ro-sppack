@@ -103,11 +103,17 @@ impl App {
     // -- event plumbing ----------------------------------------------------------
 
     fn push_log(&mut self, source: &str, text: String, level: LogLevel) {
-        if let Err(error) = self.log_files.write(&self.settings.install_dir, source, &text) {
-            if !self.log_file_error_shown {
-                self.log_file_error_shown = true;
-                self.push_log_line("launcher", format!("could not write log files: {error}"), LogLevel::Warn);
-            }
+        if let Err(error) = self
+            .log_files
+            .write(&self.settings.install_dir, source, &text)
+            && !self.log_file_error_shown
+        {
+            self.log_file_error_shown = true;
+            self.push_log_line(
+                "launcher",
+                format!("could not write log files: {error}"),
+                LogLevel::Warn,
+            );
         }
         self.push_log_line(source, text, level);
     }
@@ -343,7 +349,13 @@ impl App {
                     install_dir: self.settings.install_dir.clone(),
                 };
                 if let Some(stdout) = child.stdout.take() {
-                    spawn_process_reader(stdout, name.to_string(), tx.clone(), ctx.clone(), sink.clone());
+                    spawn_process_reader(
+                        stdout,
+                        name.to_string(),
+                        tx.clone(),
+                        ctx.clone(),
+                        sink.clone(),
+                    );
                 }
                 if let Some(stderr) = child.stderr.take() {
                     spawn_process_reader(stderr, name.to_string(), tx.clone(), ctx.clone(), sink);
@@ -439,6 +451,7 @@ impl App {
             && settings.client_built()
             && settings.remote_client_built()
             && assets::is_ready(settings)
+            && (!settings.install_translation || settings.translation_applied())
     }
 
     // -- UI ----------------------------------------------------------------------
@@ -505,6 +518,14 @@ impl App {
                     assets::is_ready(&settings),
                     !settings.assets_dir.as_os_str().is_empty(),
                 );
+                if settings.install_translation {
+                    status_line(
+                        ui,
+                        "translation",
+                        settings.translation_applied(),
+                        settings.translation_cloned(),
+                    );
+                }
                 ui.add_space(10.0);
                 ui.separator();
                 ui.add_space(6.0);
@@ -720,6 +741,19 @@ impl App {
                     &mut self.settings.copy_bgm_ai,
                     "Copy BGM/ and AI/ folders (otherwise referenced in place)",
                 );
+                ui.add_space(4.0);
+                ui.checkbox(
+                    &mut self.settings.install_translation,
+                    "Install the English translation (ROenglishPRE)",
+                );
+                ui.label(
+                    RichText::new(
+                        "Cloned during setup and copied over the client data files (Lua tables, name/description tables, interface textures) — no GRF repacking needed. Enabled by default on English systems.",
+                    )
+                    .small()
+                    .color(MUTED),
+                );
+                ui.add_space(4.0);
             });
 
             ui.add_space(8.0);
@@ -980,6 +1014,48 @@ impl App {
                 );
             }
         });
+
+        // Translation ------------------------------------------------------------
+        if settings.install_translation {
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Translation · ROenglishPRE").strong());
+                state_chip_with(
+                    ui,
+                    settings.translation_applied(),
+                    settings.translation_cloned(),
+                    "applied",
+                    "cloned, not applied",
+                );
+            });
+            ui.label(
+                RichText::new(settings.translation_dir().display().to_string())
+                    .small()
+                    .color(MUTED),
+            );
+            if settings.translation_cloned() {
+                ui.horizontal(|ui| {
+                    if ui.button("Apply into data").clicked() {
+                        self.enqueue(
+                            "Apply English translation",
+                            JobKind::CopyTranslation {
+                                source: settings.translation_dir(),
+                                webroot: settings.webroot(),
+                                marker: settings.translation_marker(),
+                            },
+                        );
+                    }
+                    if ui.button("Update (git pull)").clicked() {
+                        self.enqueue(
+                            "Update English translation",
+                            JobKind::GitPull {
+                                dir: settings.translation_dir(),
+                            },
+                        );
+                    }
+                });
+            }
+        }
     }
 
     fn dashboard_tab(&mut self, ui: &mut egui::Ui) {
@@ -1166,10 +1242,20 @@ fn status_line(ui: &mut egui::Ui, label: &str, ready: bool, started: bool) {
 }
 
 fn state_chip(ui: &mut egui::Ui, built: bool, cloned: bool) {
-    let (text, color) = if built {
-        ("built", OK)
+    state_chip_with(ui, built, cloned, "built", "cloned, not built");
+}
+
+fn state_chip_with(
+    ui: &mut egui::Ui,
+    ready: bool,
+    cloned: bool,
+    ready_text: &str,
+    cloned_text: &str,
+) {
+    let (text, color) = if ready {
+        (ready_text, OK)
     } else if cloned {
-        ("cloned, not built", WARN)
+        (cloned_text, WARN)
     } else {
         ("missing", BAD)
     };

@@ -194,6 +194,113 @@ pub fn copy_assets(
     ))
 }
 
+/// Copy the translation repository's `data/` and `System/` trees over the
+/// package's loose client files. The remote client serves these before the
+/// archives, so the translation wins without repacking any GRF. A small marker
+/// file records that the copy is up to date.
+pub fn copy_translation(
+    id: u64,
+    source: &Path,
+    webroot: &Path,
+    marker: &Path,
+    tx: &Sender<AppEvent>,
+    ctx: &egui::Context,
+    cancel: &AtomicBool,
+) -> Result<String, String> {
+    if !source.is_dir() {
+        return Err(format!(
+            "translation repository not found: {}",
+            source.display()
+        ));
+    }
+
+    let mut tasks: Vec<CopyTask> = Vec::new();
+    for folder in ["data", "System"] {
+        let dir = source.join(folder);
+        if dir.is_dir() {
+            collect_tree(&dir, &webroot.join(folder), &mut tasks)?;
+        }
+    }
+    if tasks.is_empty() {
+        return Err(format!(
+            "no data/ or System/ files in translation repository: {}",
+            source.display()
+        ));
+    }
+
+    // A same-size file may still have new contents after a `git pull`, so stale
+    // copies are only skipped when they are at least as new as the source.
+    for task in &mut tasks {
+        if !task.skip {
+            continue;
+        }
+        let source_time = fs::metadata(&task.src)
+            .and_then(|meta| meta.modified())
+            .ok();
+        let dest_time = fs::metadata(&task.dst)
+            .and_then(|meta| meta.modified())
+            .ok();
+        if let (Some(source_time), Some(dest_time)) = (source_time, dest_time)
+            && dest_time < source_time
+        {
+            task.skip = false;
+        }
+    }
+
+    let total: u64 = tasks.iter().map(|task| task.size).sum();
+    let mut done: u64 = tasks
+        .iter()
+        .filter(|task| task.skip)
+        .map(|task| task.size)
+        .sum();
+    let mut last_report = Instant::now();
+    report(id, done, total, "applying translation", tx, ctx);
+
+    for task in &tasks {
+        if cancel.load(Ordering::SeqCst) {
+            return Err("cancelled".into());
+        }
+        if task.skip {
+            continue;
+        }
+        copy_file(
+            task,
+            id,
+            &mut done,
+            total,
+            tx,
+            ctx,
+            cancel,
+            &mut last_report,
+        )?;
+    }
+
+    let updated = tasks.iter().filter(|task| !task.skip).count();
+    let details = serde_json::json!({
+        "source": source.display().to_string(),
+        "webroot": webroot.display().to_string(),
+        "files": tasks.len(),
+        "updated": updated,
+        "total_bytes": total,
+        "applied_at": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0),
+    });
+    if let Some(parent) = marker.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    let text = serde_json::to_string_pretty(&details).unwrap_or_else(|_| "{}".into());
+    fs::write(marker, text).map_err(|e| format!("write {}: {e}", marker.display()))?;
+
+    Ok(format!(
+        "translation: {} file(s), {} updated; {} total",
+        tasks.len(),
+        updated,
+        human_bytes(total)
+    ))
+}
+
 fn collect_grfs(source: &Path) -> Result<Vec<PathBuf>, String> {
     let ini = source.join("DATA.INI");
     let mut found: Vec<PathBuf> = Vec::new();
@@ -431,6 +538,54 @@ mod tests {
     fn data_ini_ignores_other_sections() {
         let parsed = parse_data_ini("[Data]\n0=yes.grf\n[Other]\n1=no.grf\n; comment\n");
         assert_eq!(parsed, vec!["yes.grf"]);
+    }
+
+    #[test]
+    fn translation_copy_overrides_loose_files_and_writes_marker() {
+        let root = temp_dir("translation");
+        let source = root.join("ROenglishPRE");
+        let webroot = root.join("webroot");
+        let marker = root.join("translation.json");
+        fs::create_dir_all(source.join("data").join("lua files")).unwrap();
+        fs::create_dir_all(source.join("System")).unwrap();
+        fs::write(
+            source.join("data").join("num2itemdesctable.txt"),
+            "translated",
+        )
+        .unwrap();
+        fs::write(
+            source
+                .join("data")
+                .join("lua files")
+                .join("skillinfolist.lub"),
+            "lub data",
+        )
+        .unwrap();
+        fs::write(source.join("System").join("itemInfo.lua"), "item info").unwrap();
+
+        // An existing loose (Korean) file must be replaced by the translation.
+        fs::create_dir_all(webroot.join("data")).unwrap();
+        fs::write(webroot.join("data").join("num2itemdesctable.txt"), "korean").unwrap();
+
+        let ctx = egui::Context::default();
+        let (tx, _rx) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        let summary = copy_translation(1, &source, &webroot, &marker, &tx, &ctx, &cancel).unwrap();
+        assert!(summary.contains("3 file(s)"), "{summary}");
+        assert_eq!(
+            fs::read_to_string(webroot.join("data").join("num2itemdesctable.txt")).unwrap(),
+            "translated"
+        );
+        assert_eq!(
+            fs::read_to_string(webroot.join("System").join("itemInfo.lua")).unwrap(),
+            "item info"
+        );
+        assert!(marker.is_file());
+
+        // Re-running without source changes copies nothing.
+        let summary = copy_translation(2, &source, &webroot, &marker, &tx, &ctx, &cancel).unwrap();
+        assert!(summary.contains("0 updated"), "{summary}");
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

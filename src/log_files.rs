@@ -43,7 +43,10 @@ impl LogFiles {
     pub fn write(&self, install_dir: &Path, source: &str, text: &str) -> Result<(), String> {
         let name = file_name(source);
         let line = format!("{} [{source}] {text}\n", timestamp());
-        let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let logs_dir = install_dir.join("logs");
         if state.dir != logs_dir {
             flush_all(&mut state);
@@ -51,17 +54,24 @@ impl LogFiles {
             state.dir = logs_dir.clone();
         }
         if !state.writers.contains_key(name) {
-            let writer = open(&logs_dir, name).map_err(|error| format!("{}: {error}", logs_dir.display()))?;
+            let writer = open(&logs_dir, name)
+                .map_err(|error| format!("{}: {error}", logs_dir.display()))?;
             state.writers.insert(name, writer);
         }
         let writer = state.writers.get_mut(name).expect("writer inserted above");
-        writer
-            .write_all(line.as_bytes())
-            .map_err(|error| format!("{}: {error}", logs_dir.join(format!("{name}.log")).display()))
+        writer.write_all(line.as_bytes()).map_err(|error| {
+            format!(
+                "{}: {error}",
+                logs_dir.join(format!("{name}.log")).display()
+            )
+        })
     }
 
     pub fn flush(&self) {
-        let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         flush_all(&mut state);
     }
 }
@@ -102,11 +112,16 @@ fn format_utc(epoch_seconds: u64) -> String {
     let shifted = days + 719_468;
     let era = shifted.div_euclid(146_097);
     let day_of_era = shifted.rem_euclid(146_097);
-    let year_of_era = (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
     let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
     let month_index = (5 * day_of_year + 2) / 153;
     let day = day_of_year - (153 * month_index + 2) / 5 + 1;
-    let month = if month_index < 10 { month_index + 3 } else { month_index - 9 };
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
     let year = year_of_era + era * 400 + i64::from(month <= 2);
     format!(
         "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}Z",
@@ -155,7 +170,11 @@ mod tests {
         second.write(&dir, "server", "second run").unwrap();
         second.flush();
         assert!(fs::read_to_string(&log).unwrap().contains("second run"));
-        assert!(fs::read_to_string(dir.join("logs").join("server.previous.log")).unwrap().contains("first run"));
+        assert!(
+            fs::read_to_string(dir.join("logs").join("server.previous.log"))
+                .unwrap()
+                .contains("first run")
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -166,8 +185,16 @@ mod tests {
         files.write(&first_dir, "web", "a").unwrap();
         files.write(&second_dir, "web", "b").unwrap();
         files.flush();
-        assert!(fs::read_to_string(first_dir.join("logs").join("web.log")).unwrap().contains("] a"));
-        assert!(fs::read_to_string(second_dir.join("logs").join("web.log")).unwrap().contains("] b"));
+        assert!(
+            fs::read_to_string(first_dir.join("logs").join("web.log"))
+                .unwrap()
+                .contains("] a")
+        );
+        assert!(
+            fs::read_to_string(second_dir.join("logs").join("web.log"))
+                .unwrap()
+                .contains("] b")
+        );
         let _ = fs::remove_dir_all(&first_dir);
         let _ = fs::remove_dir_all(&second_dir);
     }
