@@ -23,7 +23,7 @@ pub enum AppEvent {
         label: String,
         result: Result<String, String>,
     },
-    /// A long-running child process (game server / asset server) printed a line.
+    /// A long-running child process (game server / native client) printed a line.
     ProcLog {
         name: String,
         line: String,

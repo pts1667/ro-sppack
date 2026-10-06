@@ -65,7 +65,7 @@ fn print_usage() {
          Options:\n  \
          --install-dir <path>   Override the install folder\n  \
          --assets-dir <path>    Override the kRO assets folder (DATA.INI + GRFs)\n  \
-         --reference-assets     Write DATA.INI with absolute paths instead of copying\n  \
+         --reference-assets     Reference the GRF archives in place instead of copying\n  \
          --prepare-assets       With --generate-configs, also prepare game assets\n  \
          --force                With --setup, rebuild/recopy everything\n\n\
          Settings are loaded from and saved to ro-sppack.json in the working directory."
@@ -107,7 +107,7 @@ fn run_generate_configs(args: &[String]) -> Result<(), String> {
         let message = assets::copy_assets(
             0,
             &settings.assets_dir,
-            &settings.webroot(),
+            &settings.client_dir(),
             settings.asset_mode == AssetMode::Reference,
             settings.copy_bgm_ai,
             settings.copy_loose_data,

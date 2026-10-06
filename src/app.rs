@@ -56,8 +56,8 @@ pub struct App {
 
     server_pid: Option<u32>,
     server_started: Option<Instant>,
-    web_pid: Option<u32>,
-    web_started: Option<Instant>,
+    client_pid: Option<u32>,
+    client_started: Option<Instant>,
 }
 
 impl App {
@@ -88,8 +88,8 @@ impl App {
             queue: VecDeque::new(),
             server_pid: None,
             server_started: None,
-            web_pid: None,
-            web_started: None,
+            client_pid: None,
+            client_started: None,
         };
 
         app.push_log(
@@ -172,9 +172,9 @@ impl App {
                         self.server_pid = None;
                         self.server_started = None;
                     }
-                    if name == "web" {
-                        self.web_pid = None;
-                        self.web_started = None;
+                    if name == "client" {
+                        self.client_pid = None;
+                        self.client_started = None;
                     }
                     let level = if code == Some(0) {
                         LogLevel::Info
@@ -276,17 +276,17 @@ impl App {
         }
     }
 
-    fn start_web(&mut self) {
-        if self.web_pid.is_some() {
+    fn start_client(&mut self) {
+        if self.client_pid.is_some() {
             return;
         }
         let settings = self.settings.clone();
-        if !settings.remote_client_built() {
+        if !settings.client_built() {
             self.push_log(
-                "web",
+                "client",
                 format!(
                     "binary not found: {} (build it in the Setup tab)",
-                    settings.remote_client_bin().display()
+                    settings.client_bin().display()
                 ),
                 LogLevel::Warn,
             );
@@ -294,24 +294,28 @@ impl App {
         }
         if let Err(error) = config_gen::generate_client(&settings) {
             self.push_log(
-                "web",
+                "client",
                 format!("configuration failed: {error}"),
                 LogLevel::Error,
             );
             return;
         }
-        let env = config_gen::remote_client_env(&settings);
-        if let Some(pid) =
-            self.spawn_managed("web", settings.remote_client_bin(), settings.webroot(), Vec::new(), env)
-        {
-            self.web_pid = Some(pid);
-            self.web_started = Some(Instant::now());
+        // The client reads config.json and data/ relative to its working dir.
+        if let Some(pid) = self.spawn_managed(
+            "client",
+            settings.client_bin(),
+            settings.client_dir(),
+            Vec::new(),
+            Vec::new(),
+        ) {
+            self.client_pid = Some(pid);
+            self.client_started = Some(Instant::now());
             self.push_log(
-                "web",
+                "client",
                 format!(
-                    "client + asset server on http://{}:{}/",
+                    "nostalro client connecting to {}:{}",
                     settings.connect_host(),
-                    settings.web_port
+                    settings.game_port
                 ),
                 LogLevel::Success,
             );
@@ -392,21 +396,20 @@ impl App {
         }
     }
 
-    fn stop_web(&mut self) {
-        if let Some(pid) = self.web_pid.take() {
+    fn stop_client(&mut self) {
+        if let Some(pid) = self.client_pid.take() {
             kill_pid(pid);
-            self.web_started = None;
-            self.push_log("web", "stopping…".into(), LogLevel::Warn);
+            self.client_started = None;
+            self.push_log("client", "stopping…".into(), LogLevel::Warn);
         }
     }
 
     fn stop_all(&mut self) {
         self.stop_server();
-        self.stop_web();
+        self.stop_client();
     }
 
     fn launch_game(&mut self) {
-        let settings = self.settings.clone();
         if !self.setup_complete() {
             self.push_log(
                 "launcher",
@@ -417,34 +420,9 @@ impl App {
             return;
         }
 
-        // start_web / start_server each regenerate their own configuration.
-        self.start_web();
+        // start_server / start_client each regenerate their own configuration.
         self.start_server();
-
-        let url = format!("http://{}:{}/", settings.connect_host(), settings.web_port);
-        if settings.auto_open_browser {
-            let wait_url = url.clone();
-            let port = settings.web_port;
-            std::thread::spawn(move || {
-                for _ in 0..120 {
-                    if std::net::TcpStream::connect_timeout(
-                        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-                        Duration::from_millis(250),
-                    )
-                    .is_ok()
-                    {
-                        open_url(&wait_url);
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(250));
-                }
-            });
-            self.push_log(
-                "launcher",
-                format!("opening {url} once the asset server is ready"),
-                LogLevel::Info,
-            );
-        }
+        self.start_client();
     }
 
     /// True when every component is built and the game assets are prepared.
@@ -452,7 +430,6 @@ impl App {
         let settings = &self.settings;
         settings.server_built()
             && settings.client_built()
-            && settings.remote_client_built()
             && assets::is_ready(settings)
             && (!settings.install_translation || settings.translation_applied())
     }
@@ -464,12 +441,17 @@ impl App {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.heading("ro-sppack");
-                ui.label(RichText::new("Ragnarok Online · rust-ro + roBrowserLegacy").color(MUTED));
+                ui.label(RichText::new("Ragnarok Online · rust-ro + nostalro-client").color(MUTED));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let ready = self.setup_complete();
                     if ui
-                        .add_enabled(ready, egui::Button::new(RichText::new("Launch Game").strong()))
-                        .on_hover_text("Generate configuration, start the server and asset server, open the browser")
+                        .add_enabled(
+                            ready,
+                            egui::Button::new(RichText::new("Launch Game").strong()),
+                        )
+                        .on_hover_text(
+                            "Generate configuration, start the game server and the native client",
+                        )
                         .clicked()
                     {
                         self.launch_game();
@@ -505,15 +487,9 @@ impl App {
                 );
                 status_line(
                     ui,
-                    "web client",
+                    "nostalro client",
                     settings.client_built(),
                     settings.client_cloned(),
-                );
-                status_line(
-                    ui,
-                    "remote client",
-                    settings.remote_client_built(),
-                    settings.remote_client_cloned(),
                 );
                 status_line(
                     ui,
@@ -534,7 +510,7 @@ impl App {
                 ui.add_space(6.0);
                 ui.label(RichText::new("Processes").strong());
                 process_line(ui, "server", self.server_pid, self.server_started);
-                process_line(ui, "web", self.web_pid, self.web_started);
+                process_line(ui, "client", self.client_pid, self.client_started);
             });
     }
 
@@ -623,7 +599,7 @@ impl App {
                     })
                     .inner;
                 let play = if ready {
-                    play.on_hover_text("Start the server and asset server, then open the browser")
+                    play.on_hover_text("Start the game server and the native client")
                 } else {
                     play.on_disabled_hover_text("Install everything first")
                 };
@@ -656,10 +632,6 @@ impl App {
 
                         ui.label("Game port");
                         ui.add(egui::DragValue::new(&mut self.settings.game_port).range(1..=65535));
-                        ui.end_row();
-
-                        ui.label("Web/asset port");
-                        ui.add(egui::DragValue::new(&mut self.settings.web_port).range(1..=65535));
                         ui.end_row();
 
                         ui.label("Packet version");
@@ -708,8 +680,6 @@ impl App {
 
                         ui.label("Options");
                         ui.horizontal_wrapped(|ui| {
-                            ui.checkbox(&mut self.settings.skip_intro, "Skip intro screen");
-                            ui.checkbox(&mut self.settings.auto_open_browser, "Open browser on launch");
                             ui.checkbox(&mut self.settings.build_release, "Release build");
                             ui.checkbox(&mut self.settings.debug_log, "Server debug log")
                                 .on_hover_text(
@@ -740,22 +710,29 @@ impl App {
                         "Reference archives in place",
                     );
                 });
+                ui.label(
+                    RichText::new(
+                        "Archives land in nostalro-client/data/ (or stay where they are and are referenced by absolute path).",
+                    )
+                    .small()
+                    .color(MUTED),
+                );
                 ui.checkbox(
                     &mut self.settings.copy_loose_data,
-                    "Copy loose data/ overrides (translations)",
+                    "Copy loose data/ overrides into data/extracted/",
                 );
                 ui.checkbox(
                     &mut self.settings.copy_bgm_ai,
-                    "Copy BGM/ and AI/ folders (otherwise referenced in place)",
+                    "Copy BGM/ into the package (otherwise referenced in place)",
                 );
                 ui.add_space(4.0);
                 ui.checkbox(
                     &mut self.settings.install_translation,
-                    "Install the English translation (ROenglishPRE)",
+                    "Install the English translation (ROenglishRE + ROenglishPRE)",
                 );
                 ui.label(
                     RichText::new(
-                        "Cloned during setup and copied over the client data files (Lua tables, name/description tables, interface textures) — no GRF repacking needed. Enabled by default on English systems.",
+                        "Cloned during setup and copied over data/extracted/ (item, skill and message tables, interface textures) — no GRF repacking needed. ROenglishPRE is layered on top of ROenglishRE. Enabled by default on English systems.",
                     )
                     .small()
                     .color(MUTED),
@@ -864,6 +841,7 @@ impl App {
                         JobKind::CargoBuild {
                             dir: settings.server_dir(),
                             release: settings.build_release,
+                            package: None,
                         },
                     );
                 }
@@ -887,17 +865,8 @@ impl App {
 
         // Client -----------------------------------------------------------------
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Client · roBrowserLegacy").strong());
-            let (text, color) = if settings.client_built() {
-                ("built", OK)
-            } else if settings.client_deps_installed() {
-                ("dependencies installed", WARN)
-            } else if settings.client_cloned() {
-                ("cloned", WARN)
-            } else {
-                ("missing", BAD)
-            };
-            ui.colored_label(color, format!("• {text}"));
+            ui.label(RichText::new("Client · nostalro-client").strong());
+            state_chip(ui, settings.client_built(), settings.client_cloned());
         });
         ui.label(
             RichText::new(settings.client_dir().display().to_string())
@@ -906,73 +875,29 @@ impl App {
         );
         if settings.client_cloned() {
             ui.horizontal(|ui| {
-                if ui.button("Install dependencies").clicked() {
-                    self.enqueue(
-                        "Install client dependencies",
-                        JobKind::NpmInstall {
-                            dir: settings.client_dir(),
-                        },
-                    );
-                }
-                if ui.button("Build web client").clicked() {
-                    self.enqueue(
-                        "Build web client",
-                        JobKind::NpmBuild {
-                            dir: settings.client_dir(),
-                            script: "build:all".into(),
-                        },
-                    );
-                }
-                if ui.button("Update (git pull)").clicked() {
-                    self.enqueue(
-                        "Update roBrowserLegacy",
-                        JobKind::GitPull {
-                            dir: settings.client_dir(),
-                        },
-                    );
-                }
-            });
-        }
-        ui.separator();
-
-        // Remote client ----------------------------------------------------------
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Asset server · Remote Client (Rust)").strong());
-            state_chip(
-                ui,
-                settings.remote_client_built(),
-                settings.remote_client_cloned(),
-            );
-        });
-        ui.label(
-            RichText::new(settings.remote_client_dir().display().to_string())
-                .small()
-                .color(MUTED),
-        );
-        if settings.remote_client_cloned() {
-            ui.horizontal(|ui| {
                 if ui.button("Build").clicked() {
                     self.enqueue(
-                        "Build remote client",
+                        "Build nostalro client",
                         JobKind::CargoBuild {
-                            dir: settings.remote_client_dir(),
+                            dir: settings.client_dir(),
                             release: settings.build_release,
+                            package: Some("ragnarok-client".into()),
                         },
                     );
                 }
                 if ui.button("Update (git pull)").clicked() {
                     self.enqueue(
-                        "Update remote client",
+                        "Update nostalro client",
                         JobKind::GitPull {
-                            dir: settings.remote_client_dir(),
+                            dir: settings.client_dir(),
                         },
                     );
                 }
                 if ui
-                    .add_enabled(settings.remote_client_built(), egui::Button::new("Run"))
+                    .add_enabled(settings.client_built(), egui::Button::new("Run"))
                     .clicked()
                 {
-                    self.start_web();
+                    self.start_client();
                 }
             });
         }
@@ -1004,7 +929,7 @@ impl App {
                         "Prepare game assets",
                         JobKind::CopyAssets {
                             source: settings.assets_dir.clone(),
-                            webroot: settings.webroot(),
+                            client: settings.client_dir(),
                             reference: settings.asset_mode == AssetMode::Reference,
                             copy_bgm_ai: settings.copy_bgm_ai,
                             copy_loose_data: settings.copy_loose_data,
@@ -1062,7 +987,7 @@ impl App {
                                 label,
                                 JobKind::CopyTranslation {
                                     source: source.clone(),
-                                    webroot: settings.webroot(),
+                                    extracted: settings.client_extracted_dir(),
                                     marker: marker.clone(),
                                 },
                             );
@@ -1110,27 +1035,27 @@ impl App {
 
             ui.group(|ui| {
                 ui.set_min_width(300.0);
-                ui.label(RichText::new("Web client + assets").strong());
-                process_card_status(ui, self.web_pid, self.web_started);
+                ui.label(RichText::new("Game client").strong());
+                process_card_status(ui, self.client_pid, self.client_started);
                 ui.label(
                     RichText::new(format!(
-                        "http://{}:{}/",
+                        "{}:{}",
                         settings.connect_host(),
-                        settings.web_port
+                        settings.game_port
                     ))
                     .small()
                     .color(MUTED),
                 );
                 ui.horizontal(|ui| {
-                    let running = self.web_pid.is_some();
+                    let running = self.client_pid.is_some();
                     if ui
                         .add_enabled(!running, egui::Button::new("Start"))
                         .clicked()
                     {
-                        self.start_web();
+                        self.start_client();
                     }
                     if ui.add_enabled(running, egui::Button::new("Stop")).clicked() {
-                        self.stop_web();
+                        self.stop_client();
                     }
                 });
             });
@@ -1138,10 +1063,7 @@ impl App {
 
         ui.add_space(10.0);
         ui.horizontal(|ui| {
-            let ready = settings.server_built()
-                && settings.client_built()
-                && settings.remote_client_built()
-                && assets::is_ready(&settings);
+            let ready = self.setup_complete();
             if ui
                 .add_enabled(
                     ready,
@@ -1154,12 +1076,8 @@ impl App {
             if ui.button("Open install folder").clicked() {
                 open_path(&settings.install_dir);
             }
-            if ui.button("Open client in browser").clicked() {
-                open_url(&format!(
-                    "http://{}:{}/",
-                    settings.connect_host(),
-                    settings.web_port
-                ));
+            if ui.button("Open client folder").clicked() {
+                open_path(&settings.client_dir());
             }
         });
 
@@ -1169,10 +1087,10 @@ impl App {
             ui.label("In-game account: admin / qwertz (id 2000000)");
             ui.label(format!(
                 "Client config: {}",
-                settings.config_local_js().display()
+                settings.client_config_json().display()
             ));
             ui.label(format!("Server config: {}", settings.server_config_json().display()));
-            ui.label("Assets are served by the remote client; rust-ro accepts WebSocket clients directly.");
+            ui.label("The client reads GRFs from nostalro-client/data; loose files in data/extracted override them.");
         });
 
         if !assets::is_ready(&settings) {
@@ -1378,26 +1296,6 @@ fn now_hhmmss() -> String {
         (secs / 60) % 60,
         secs % 60
     )
-}
-
-fn open_url(url: &str) {
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        let mut command = Command::new("cmd");
-        command
-            .args(["/C", "start", "", url])
-            .creation_flags(0x0800_0000);
-        let _ = command.spawn();
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = Command::new("open").arg(url).spawn();
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        let _ = Command::new("xdg-open").arg(url).spawn();
-    }
 }
 
 fn open_path(path: &Path) {

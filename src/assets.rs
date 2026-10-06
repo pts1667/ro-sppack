@@ -1,5 +1,9 @@
-//! Preparing game archives for the remote client: DATA.INI parsing, copying and
-//! progress reporting.
+//! Preparing the native client's data: GRF archives, loose overrides and the
+//! English translation layers.
+//!
+//! The client resolves files in this order: `data_dir` (loose files that
+//! override archive entries) first, then every archive in `grf_paths` in
+//! order. Everything here works towards that layout.
 
 use crate::events::AppEvent;
 use crate::settings::Settings;
@@ -19,34 +23,49 @@ struct CopyTask {
     skip: bool,
 }
 
-/// True when `resources/DATA.INI` exists and every archive it lists is present.
-pub fn is_ready(settings: &Settings) -> bool {
-    let resources = settings.resources_dir();
-    let entries = read_data_ini(&resources);
-    !entries.is_empty() && entries.iter().all(|path| path.is_file())
-}
-
-/// Resolve the DATA.INI entries in `resources/` to concrete file paths.
-pub fn read_data_ini(resources: &Path) -> Vec<PathBuf> {
-    let ini = resources.join("DATA.INI");
-    let Ok(content) = fs::read_to_string(&ini) else {
+/// Archive paths as written into the client `config.json`, read from the
+/// manifest produced by [`copy_assets`].
+pub fn grf_paths(settings: &Settings) -> Vec<String> {
+    let path = settings.client_assets_manifest();
+    let Ok(text) = fs::read_to_string(&path) else {
         return Vec::new();
     };
-    parse_data_ini(&content)
-        .into_iter()
-        .map(|entry| {
-            let path = Path::new(&entry);
-            if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                resources.join(path)
-            }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    value
+        .get("grf_paths")
+        .and_then(|value| value.as_array())
+        .map(|list| {
+            list.iter()
+                .filter_map(|entry| entry.as_str().map(str::to_string))
+                .collect()
         })
-        .collect()
+        .unwrap_or_default()
+}
+
+/// Resolve a manifest entry to a file path. Relative entries are relative to
+/// the client directory, which is also its working directory.
+pub fn resolve_grf(settings: &Settings, entry: &str) -> PathBuf {
+    let path = Path::new(entry);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        settings.client_dir().join(path)
+    }
+}
+
+/// True when the manifest exists and every archive it lists is present.
+pub fn is_ready(settings: &Settings) -> bool {
+    let paths = grf_paths(settings);
+    !paths.is_empty()
+        && paths
+            .iter()
+            .all(|entry| resolve_grf(settings, entry).is_file())
 }
 
 /// The `[Data]` section of a DATA.INI in index order (lower index wins).
-/// Mirrors the parser in the remote client so the generated file behaves the same.
+/// Same semantics as the kRO client so an existing `DATA.INI` keeps working.
 pub fn parse_data_ini(content: &str) -> Vec<String> {
     let mut entries: Vec<(i64, String)> = Vec::new();
     let mut in_data = false;
@@ -80,11 +99,14 @@ pub fn parse_data_ini(content: &str) -> Vec<String> {
     entries.into_iter().map(|(_, value)| value).collect()
 }
 
+/// Prepare the client's `data/` folder: copy the archives (or reference them in
+/// place), copy loose overrides into `data/extracted`, optionally copy BGM, and
+/// write the manifest the configuration step reads.
 #[allow(clippy::too_many_arguments)]
 pub fn copy_assets(
     id: u64,
     source: &Path,
-    webroot: &Path,
+    client_dir: &Path,
     reference: bool,
     copy_bgm_ai: bool,
     copy_loose_data: bool,
@@ -95,8 +117,8 @@ pub fn copy_assets(
     if !source.is_dir() {
         return Err(format!("assets folder not found: {}", source.display()));
     }
-    let resources = webroot.join("resources");
-    fs::create_dir_all(&resources).map_err(|e| format!("create {}: {e}", resources.display()))?;
+    let data_dir = client_dir.join("data");
+    fs::create_dir_all(&data_dir).map_err(|e| format!("create {}: {e}", data_dir.display()))?;
 
     let grfs = collect_grfs(source)?;
     if grfs.is_empty() {
@@ -107,21 +129,21 @@ pub fn copy_assets(
     }
 
     let mut tasks: Vec<CopyTask> = Vec::new();
-    let mut data_ini = String::from("[Data]\r\n");
+    let mut grf_paths: Vec<String> = Vec::new();
 
     if reference {
-        for (index, grf) in grfs.iter().enumerate() {
-            data_ini.push_str(&format!("{index}={}\r\n", canonical_path(grf).display()));
+        for grf in &grfs {
+            grf_paths.push(canonical_path(grf).display().to_string());
         }
     } else {
         let mut used_names: Vec<String> = Vec::new();
-        for (index, grf) in grfs.iter().enumerate() {
+        for grf in &grfs {
             let original = grf
                 .file_name()
                 .map(|name| name.to_string_lossy().to_string())
-                .unwrap_or_else(|| format!("archive_{index}.grf"));
+                .unwrap_or_else(|| "archive.grf".to_string());
             let name = unique_name(&original, &mut used_names);
-            let dst = resources.join(&name);
+            let dst = data_dir.join(&name);
             let size = fs::metadata(grf).map(|meta| meta.len()).unwrap_or(0);
             let skip = dst.is_file()
                 && fs::metadata(&dst)
@@ -133,27 +155,35 @@ pub fn copy_assets(
                 size,
                 skip,
             });
-            data_ini.push_str(&format!("{index}={name}\r\n"));
+            grf_paths.push(format!("data/{name}"));
         }
     }
 
     if copy_loose_data {
-        let data_src = source.join("data");
-        if data_src.is_dir() {
-            collect_tree(&data_src, &webroot.join("data"), &mut tasks)?;
+        // `data_dir` mirrors the archive's `data/` folder, so loose files are
+        // copied without the leading `data/` component.
+        let loose = source.join("data");
+        if loose.is_dir() {
+            collect_tree(&loose, &data_dir.join("extracted"), &mut tasks)?;
         }
     }
     if copy_bgm_ai {
-        for folder in ["BGM", "AI"] {
-            let folder_src = source.join(folder);
-            if folder_src.is_dir() {
-                collect_tree(&folder_src, &webroot.join(folder), &mut tasks)?;
-            }
+        let bgm = source.join("BGM");
+        if bgm.is_dir() {
+            collect_tree(&bgm, &data_dir.join("BGM"), &mut tasks)?;
         }
     }
 
-    let ini_path = resources.join("DATA.INI");
-    fs::write(&ini_path, data_ini).map_err(|e| format!("write {}: {e}", ini_path.display()))?;
+    let manifest = serde_json::json!({
+        "mode": if reference { "reference" } else { "copy" },
+        "source": source.display().to_string(),
+        "grf_paths": grf_paths,
+    });
+    let manifest_path = data_dir.join("ro-sppack-assets.json");
+    let text = serde_json::to_string_pretty(&manifest)
+        .map_err(|e| format!("serialize assets manifest: {e}"))?;
+    fs::write(&manifest_path, text)
+        .map_err(|e| format!("write {}: {e}", manifest_path.display()))?;
 
     let total: u64 = tasks.iter().map(|task| task.size).sum();
     let mut done: u64 = tasks
@@ -194,14 +224,16 @@ pub fn copy_assets(
     ))
 }
 
-/// Copy the translation repository's `data/` and `System/` trees over the
-/// package's loose client files. The remote client serves these before the
-/// archives, so the translation wins without repacking any GRF. A small marker
-/// file records that the copy is up to date.
+/// Copy a translation layer's `data/` tree over the client's loose overrides.
+/// `source` is the repository root that contains `data/`; files are copied
+/// without the leading `data/` component, matching the client's `data_dir`.
+///
+/// Every file is rewritten (no size-based skipping): the PRE layer replaces RE
+/// files that may have the same size but different contents.
 pub fn copy_translation(
     id: u64,
     source: &Path,
-    webroot: &Path,
+    extracted: &Path,
     marker: &Path,
     tx: &Sender<AppEvent>,
     ctx: &egui::Context,
@@ -213,43 +245,34 @@ pub fn copy_translation(
             source.display()
         ));
     }
-
-    let mut tasks: Vec<CopyTask> = Vec::new();
-    for folder in ["data", "System"] {
-        let dir = source.join(folder);
-        if dir.is_dir() {
-            collect_tree(&dir, &webroot.join(folder), &mut tasks)?;
-        }
-    }
-    if tasks.is_empty() {
+    let data = source.join("data");
+    if !data.is_dir() {
         return Err(format!(
-            "no data/ or System/ files in translation repository: {}",
+            "no data/ folder in translation repository: {}",
             source.display()
         ));
     }
 
-    // Translations are layered (ROenglishPRE over ROenglishRE) and a file may be
-    // replaced by different content of the same size, so every file is rewritten.
-    // The marker file makes repeat runs of an already-applied layer unnecessary.
+    let mut tasks: Vec<CopyTask> = Vec::new();
+    collect_tree(&data, extracted, &mut tasks)?;
+    if tasks.is_empty() {
+        return Err(format!(
+            "no files under {} in translation repository",
+            data.display()
+        ));
+    }
     for task in &mut tasks {
         task.skip = false;
     }
 
     let total: u64 = tasks.iter().map(|task| task.size).sum();
-    let mut done: u64 = tasks
-        .iter()
-        .filter(|task| task.skip)
-        .map(|task| task.size)
-        .sum();
+    let mut done: u64 = 0;
     let mut last_report = Instant::now();
     report(id, done, total, "applying translation", tx, ctx);
 
     for task in &tasks {
         if cancel.load(Ordering::SeqCst) {
             return Err("cancelled".into());
-        }
-        if task.skip {
-            continue;
         }
         copy_file(
             task,
@@ -263,12 +286,11 @@ pub fn copy_translation(
         )?;
     }
 
-    let updated = tasks.iter().filter(|task| !task.skip).count();
     let details = serde_json::json!({
         "source": source.display().to_string(),
-        "webroot": webroot.display().to_string(),
+        "extracted": extracted.display().to_string(),
         "files": tasks.len(),
-        "updated": updated,
+        "updated": tasks.len(),
         "total_bytes": total,
         "applied_at": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -282,9 +304,8 @@ pub fn copy_translation(
     fs::write(marker, text).map_err(|e| format!("write {}: {e}", marker.display()))?;
 
     Ok(format!(
-        "translation: {} file(s), {} updated; {} total",
+        "translation: {} file(s), {} total",
         tasks.len(),
-        updated,
         human_bytes(total)
     ))
 }
@@ -481,7 +502,20 @@ fn has_archive_extension(path: &Path) -> bool {
 }
 
 fn canonical_path(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    // Verbatim paths do not accept `/` as a separator and do not resolve `..`,
+    // so the generated client config would contain paths it cannot open.
+    #[cfg(windows)]
+    {
+        let text = resolved.to_string_lossy();
+        if let Some(rest) = text.strip_prefix(r"\\?\")
+            && rest.as_bytes().get(1) == Some(&b':')
+            && !rest.starts_with("UNC\\")
+        {
+            return PathBuf::from(rest.to_string());
+        }
+    }
+    resolved
 }
 
 pub fn human_bytes(bytes: u64) -> String {
@@ -516,6 +550,13 @@ mod tests {
         dir
     }
 
+    fn settings_for(install: &Path) -> Settings {
+        Settings {
+            install_dir: install.to_path_buf(),
+            ..Settings::default()
+        }
+    }
+
     #[test]
     fn data_ini_is_sorted_by_numeric_index() {
         let parsed = parse_data_ini("[Data]\n2=data.grf\n0=custom.grf\n1=rdata.grf\n");
@@ -529,11 +570,75 @@ mod tests {
     }
 
     #[test]
+    fn copy_mode_writes_archives_loose_data_and_manifest() {
+        let root = temp_dir("assets-copy");
+        let source = root.join("kro");
+        let client = root.join("nostalro-client");
+        fs::create_dir_all(source.join("data").join("texture")).unwrap();
+        fs::write(source.join("DATA.INI"), "[Data]\n0=data.grf\n1=rdata.grf\n").unwrap();
+        fs::write(source.join("data.grf"), b"data").unwrap();
+        fs::write(source.join("rdata.grf"), b"rdata").unwrap();
+        fs::write(source.join("data").join("texture").join("x.bmp"), b"loose").unwrap();
+
+        let ctx = egui::Context::default();
+        let (tx, _rx) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        let summary =
+            copy_assets(1, &source, &client, false, false, true, &tx, &ctx, &cancel).unwrap();
+        assert!(summary.contains("2 archive(s)"), "{summary}");
+        assert!(client.join("data").join("data.grf").is_file());
+        assert!(client.join("data").join("rdata.grf").is_file());
+        // Loose files lose the leading `data/` component.
+        assert_eq!(
+            fs::read_to_string(
+                client
+                    .join("data")
+                    .join("extracted")
+                    .join("texture")
+                    .join("x.bmp")
+            )
+            .unwrap(),
+            "loose"
+        );
+
+        let settings = settings_for(&root);
+        assert_eq!(
+            grf_paths(&settings),
+            vec!["data/data.grf", "data/rdata.grf"]
+        );
+        assert!(is_ready(&settings));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn reference_mode_keeps_archives_in_place() {
+        let root = temp_dir("assets-reference");
+        let source = root.join("kro");
+        let client = root.join("nostalro-client");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("DATA.INI"), "[Data]\n0=data.grf\n").unwrap();
+        fs::write(source.join("data.grf"), b"data").unwrap();
+
+        let ctx = egui::Context::default();
+        let (tx, _rx) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        copy_assets(1, &source, &client, true, false, true, &tx, &ctx, &cancel).unwrap();
+
+        let settings = settings_for(&root);
+        let paths = grf_paths(&settings);
+        assert_eq!(paths.len(), 1);
+        assert!(Path::new(&paths[0]).is_absolute(), "{paths:?}");
+        assert!(is_ready(&settings));
+        assert!(!client.join("data").join("data.grf").exists());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn translation_copy_overrides_loose_files_and_writes_marker() {
         let root = temp_dir("translation");
         let source = root.join("ROenglishPRE");
-        let webroot = root.join("webroot");
-        let marker = root.join("translation.json");
+        let extracted = root.join("nostalro-client").join("data").join("extracted");
+        let marker = root.join("translation-pre.json");
         fs::create_dir_all(source.join("data").join("lua files")).unwrap();
         fs::create_dir_all(source.join("System")).unwrap();
         fs::write(
@@ -552,22 +657,27 @@ mod tests {
         fs::write(source.join("System").join("itemInfo.lua"), "item info").unwrap();
 
         // An existing loose (Korean) file must be replaced by the translation.
-        fs::create_dir_all(webroot.join("data")).unwrap();
-        fs::write(webroot.join("data").join("num2itemdesctable.txt"), "korean").unwrap();
+        fs::create_dir_all(&extracted).unwrap();
+        fs::write(extracted.join("num2itemdesctable.txt"), "korean").unwrap();
 
         let ctx = egui::Context::default();
         let (tx, _rx) = mpsc::channel();
         let cancel = AtomicBool::new(false);
-        let summary = copy_translation(1, &source, &webroot, &marker, &tx, &ctx, &cancel).unwrap();
-        assert!(summary.contains("3 file(s)"), "{summary}");
+        let summary =
+            copy_translation(1, &source, &extracted, &marker, &tx, &ctx, &cancel).unwrap();
+        assert!(summary.contains("2 file(s)"), "{summary}");
         assert_eq!(
-            fs::read_to_string(webroot.join("data").join("num2itemdesctable.txt")).unwrap(),
+            fs::read_to_string(extracted.join("num2itemdesctable.txt")).unwrap(),
             "translated"
         );
-        assert_eq!(
-            fs::read_to_string(webroot.join("System").join("itemInfo.lua")).unwrap(),
-            "item info"
+        assert!(
+            extracted
+                .join("lua files")
+                .join("skillinfolist.lub")
+                .is_file()
         );
+        // System/ is for the 2013+ official client; the native client ignores it.
+        assert!(!extracted.join("System").exists());
         assert!(marker.is_file());
 
         // Same-size changes still win (this is how the PRE layer overrides RE).
@@ -579,97 +689,11 @@ mod tests {
             "LUB DATA",
         )
         .unwrap();
-        let summary = copy_translation(2, &source, &webroot, &marker, &tx, &ctx, &cancel).unwrap();
-        assert!(summary.contains("3 updated"), "{summary}");
+        copy_translation(2, &source, &extracted, &marker, &tx, &ctx, &cancel).unwrap();
         assert_eq!(
-            fs::read_to_string(
-                webroot
-                    .join("data")
-                    .join("lua files")
-                    .join("skillinfolist.lub")
-            )
-            .unwrap(),
+            fs::read_to_string(extracted.join("lua files").join("skillinfolist.lub")).unwrap(),
             "LUB DATA"
         );
         fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn copy_assets_writes_manifest_and_archives() {
-        let source = temp_dir("source");
-        let install = temp_dir("install");
-        fs::write(
-            source.join("DATA.INI"),
-            "[Data]\n1=data.grf\n0=custom.grf\n",
-        )
-        .unwrap();
-        fs::write(source.join("data.grf"), b"fake-grf-one").unwrap();
-        fs::write(source.join("custom.grf"), b"fake-grf-two").unwrap();
-        fs::create_dir_all(source.join("data").join("luafiles514")).unwrap();
-        fs::write(
-            source.join("data").join("luafiles514").join("a.lua"),
-            b"return 1",
-        )
-        .unwrap();
-
-        let webroot = install.join("webroot");
-        let (tx, _rx) = mpsc::channel();
-        let cancel = AtomicBool::new(false);
-        let message = copy_assets(
-            1,
-            &source,
-            &webroot,
-            false,
-            false,
-            true,
-            &tx,
-            &egui::Context::default(),
-            &cancel,
-        )
-        .unwrap();
-
-        assert!(message.contains("copied"));
-        assert!(webroot.join("resources").join("custom.grf").is_file());
-        assert!(webroot.join("resources").join("data.grf").is_file());
-        assert!(
-            webroot
-                .join("data")
-                .join("luafiles514")
-                .join("a.lua")
-                .is_file()
-        );
-        let manifest = fs::read_to_string(webroot.join("resources").join("DATA.INI")).unwrap();
-        let entries = parse_data_ini(&manifest);
-        assert_eq!(entries, vec!["custom.grf", "data.grf"]);
-    }
-
-    #[test]
-    fn reference_mode_keeps_archives_in_place() {
-        let source = temp_dir("reference-source");
-        let install = temp_dir("reference-install");
-        fs::write(source.join("DATA.INI"), "[Data]\n0=data.grf\n").unwrap();
-        fs::write(source.join("data.grf"), b"fake").unwrap();
-
-        let webroot = install.join("webroot");
-        let (tx, _rx) = mpsc::channel();
-        let cancel = AtomicBool::new(false);
-        copy_assets(
-            1,
-            &source,
-            &webroot,
-            true,
-            false,
-            false,
-            &tx,
-            &egui::Context::default(),
-            &cancel,
-        )
-        .unwrap();
-
-        assert!(!webroot.join("resources").join("data.grf").exists());
-        let manifest = fs::read_to_string(webroot.join("resources").join("DATA.INI")).unwrap();
-        let entries = parse_data_ini(&manifest);
-        assert_eq!(entries.len(), 1);
-        assert!(Path::new(&entries[0]).is_absolute());
     }
 }

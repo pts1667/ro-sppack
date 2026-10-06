@@ -1,4 +1,4 @@
-//! Sequential background job runner: git clones, cargo/npm builds, asset copy.
+//! Sequential background job runner: git clones, cargo builds, asset copy.
 
 use crate::assets;
 use crate::config_gen;
@@ -26,24 +26,19 @@ pub enum JobKind {
     CargoBuild {
         dir: PathBuf,
         release: bool,
-    },
-    NpmInstall {
-        dir: PathBuf,
-    },
-    NpmBuild {
-        dir: PathBuf,
-        script: String,
+        /// Optional `-p <package>` for workspace repositories.
+        package: Option<String>,
     },
     CopyAssets {
         source: PathBuf,
-        webroot: PathBuf,
+        client: PathBuf,
         reference: bool,
         copy_bgm_ai: bool,
         copy_loose_data: bool,
     },
     CopyTranslation {
         source: PathBuf,
-        webroot: PathBuf,
+        extracted: PathBuf,
         marker: PathBuf,
     },
     GenerateConfigs {
@@ -172,7 +167,11 @@ fn run_job(
             pid_slot,
         ),
 
-        JobKind::CargoBuild { dir, release } => {
+        JobKind::CargoBuild {
+            dir,
+            release,
+            package,
+        } => {
             // rust-ro pins a nightly toolchain in rust-toolchain.toml. Install it
             // explicitly (a no-op when present) and build with it, instead of
             // relying on the default toolchain being nightly.
@@ -220,6 +219,10 @@ fn run_job(
             if *release {
                 cargo_args.push("--release".into());
             }
+            if let Some(package) = package {
+                cargo_args.push("-p".into());
+                cargo_args.push(package.clone());
+            }
             run_program(
                 job.id,
                 "cargo",
@@ -233,55 +236,9 @@ fn run_job(
             )
         }
 
-        JobKind::NpmInstall { dir } => {
-            let program = npm_program();
-            let ci = run_program(
-                job.id,
-                program,
-                &["ci".into()],
-                dir,
-                &[],
-                tx,
-                ctx,
-                cancel,
-                pid_slot,
-            );
-            if ci.is_ok() {
-                return ci;
-            }
-            let _ = tx.send(AppEvent::JobLog {
-                id: job.id,
-                line: "npm ci failed, falling back to npm install".into(),
-            });
-            ctx.request_repaint();
-            run_program(
-                job.id,
-                program,
-                &["install".into()],
-                dir,
-                &[],
-                tx,
-                ctx,
-                cancel,
-                pid_slot,
-            )
-        }
-
-        JobKind::NpmBuild { dir, script } => run_program(
-            job.id,
-            npm_program(),
-            &["run".into(), script.clone()],
-            dir,
-            &[],
-            tx,
-            ctx,
-            cancel,
-            pid_slot,
-        ),
-
         JobKind::CopyAssets {
             source,
-            webroot,
+            client,
             reference,
             copy_bgm_ai,
             copy_loose_data,
@@ -289,7 +246,7 @@ fn run_job(
             let message = assets::copy_assets(
                 job.id,
                 source,
-                webroot,
+                client,
                 *reference,
                 *copy_bgm_ai,
                 *copy_loose_data,
@@ -307,11 +264,11 @@ fn run_job(
 
         JobKind::CopyTranslation {
             source,
-            webroot,
+            extracted,
             marker,
         } => {
             let message =
-                assets::copy_translation(job.id, source, webroot, marker, tx, ctx, cancel)?;
+                assets::copy_translation(job.id, source, extracted, marker, tx, ctx, cancel)?;
             let _ = tx.send(AppEvent::JobLog {
                 id: job.id,
                 line: message.clone(),
@@ -411,10 +368,6 @@ fn spawn_reader<R: Read + Send + 'static>(
     })
 }
 
-pub fn npm_program() -> &'static str {
-    if cfg!(windows) { "npm.cmd" } else { "npm" }
-}
-
 /// Read the pinned toolchain channel from `rust-toolchain.toml` (or the legacy
 /// `rust-toolchain` file) in `dir`. Returns `None` when there is no pin.
 pub fn read_toolchain_channel(dir: &Path) -> Option<String> {
@@ -476,24 +429,13 @@ pub fn install_plan(settings: &Settings, force: bool) -> Vec<(String, JobKind)> 
     let mut have_client = settings.client_cloned();
     if !have_client {
         plan.push((
-            "Clone roBrowserLegacy client".to_string(),
+            "Clone nostalro client".to_string(),
             JobKind::GitClone {
                 url: settings.client_repo.clone(),
                 dest: settings.client_dir(),
             },
         ));
         have_client = true;
-    }
-    let mut have_remote = settings.remote_client_cloned();
-    if !have_remote {
-        plan.push((
-            "Clone remote client".to_string(),
-            JobKind::GitClone {
-                url: settings.remote_client_repo.clone(),
-                dest: settings.remote_client_dir(),
-            },
-        ));
-        have_remote = true;
     }
 
     let mut have_translation_re = settings.translation_re_cloned();
@@ -525,32 +467,17 @@ pub fn install_plan(settings: &Settings, force: bool) -> Vec<(String, JobKind)> 
             JobKind::CargoBuild {
                 dir: settings.server_dir(),
                 release: settings.build_release,
-            },
-        ));
-    }
-    if have_client && (force || !settings.client_deps_installed()) {
-        plan.push((
-            "Install client dependencies".to_string(),
-            JobKind::NpmInstall {
-                dir: settings.client_dir(),
+                package: None,
             },
         ));
     }
     if have_client && (force || !settings.client_built()) {
         plan.push((
-            "Build web client".to_string(),
-            JobKind::NpmBuild {
-                dir: settings.client_dir(),
-                script: "build:all".into(),
-            },
-        ));
-    }
-    if have_remote && (force || !settings.remote_client_built()) {
-        plan.push((
-            "Build remote client".to_string(),
+            "Build nostalro client".to_string(),
             JobKind::CargoBuild {
-                dir: settings.remote_client_dir(),
+                dir: settings.client_dir(),
                 release: settings.build_release,
+                package: Some("ragnarok-client".into()),
             },
         ));
     }
@@ -559,7 +486,7 @@ pub fn install_plan(settings: &Settings, force: bool) -> Vec<(String, JobKind)> 
             "Prepare game assets".to_string(),
             JobKind::CopyAssets {
                 source: settings.assets_dir.clone(),
-                webroot: settings.webroot(),
+                client: settings.client_dir(),
                 reference: settings.asset_mode == crate::settings::AssetMode::Reference,
                 copy_bgm_ai: settings.copy_bgm_ai,
                 copy_loose_data: settings.copy_loose_data,
@@ -576,7 +503,7 @@ pub fn install_plan(settings: &Settings, force: bool) -> Vec<(String, JobKind)> 
             "Apply English translation (ROenglishRE)".to_string(),
             JobKind::CopyTranslation {
                 source: settings.translation_re_source(),
-                webroot: settings.webroot(),
+                extracted: settings.client_extracted_dir(),
                 marker: settings.translation_re_marker(),
             },
         ));
@@ -589,7 +516,7 @@ pub fn install_plan(settings: &Settings, force: bool) -> Vec<(String, JobKind)> 
             "Apply English translation (ROenglishPRE)".to_string(),
             JobKind::CopyTranslation {
                 source: settings.translation_pre_source(),
-                webroot: settings.webroot(),
+                extracted: settings.client_extracted_dir(),
                 marker: settings.translation_pre_marker(),
             },
         ));
@@ -660,6 +587,8 @@ mod tests {
             read_toolchain_channel(&legacy).as_deref(),
             Some("nightly-2026-01-01")
         );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&legacy);
     }
 
     #[test]
@@ -706,16 +635,16 @@ mod tests {
         );
     }
 
-    /// Requires git, cargo and Node/npm to be installed. Run with:
+    /// Requires git and cargo to be installed. Run with:
     /// `cargo test -- --ignored`
     #[test]
-    #[ignore = "requires git, cargo and npm on PATH"]
+    #[ignore = "requires git and cargo on PATH"]
     fn external_toolchain_is_reachable() {
         let ctx = egui::Context::default();
         let (tx, _rx) = mpsc::channel();
         let cancel = AtomicBool::new(false);
         let pid = AtomicU32::new(0);
-        for program in ["git", "cargo", npm_program()] {
+        for program in ["git", "cargo"] {
             let result = run_program(
                 1,
                 program,

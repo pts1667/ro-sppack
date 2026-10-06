@@ -8,14 +8,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const FLUSH_INTERVAL: Duration = Duration::from_secs(10);
-const PROCESS_SOURCES: [&str; 2] = ["server", "web"];
+const PROCESS_SOURCES: [&str; 2] = ["server", "client"];
 
 struct State {
     dir: PathBuf,
     writers: HashMap<&'static str, BufWriter<File>>,
 }
 
-/// Appends log lines to `server.log`, `web.log` and `launcher.log`; a background thread flushes them every
+/// Appends log lines to `server.log`, `client.log` and `launcher.log`; a background thread flushes them every
 /// ten seconds so the files can be read while the game runs. The previous run's file is kept as `<name>.previous.log`.
 pub struct LogFiles {
     state: Mutex<State>,
@@ -151,7 +151,7 @@ mod tests {
     #[test]
     fn routes_processes_to_their_own_file_and_everything_else_to_the_launcher_file() {
         assert_eq!(file_name("server"), "server");
-        assert_eq!(file_name("web"), "web");
+        assert_eq!(file_name("client"), "client");
         assert_eq!(file_name("job"), "launcher");
         assert_eq!(file_name("setup"), "launcher");
     }
@@ -182,16 +182,16 @@ mod tests {
     fn changing_the_install_dir_switches_the_target_folder() {
         let (first_dir, second_dir) = (temp_dir("dir-a"), temp_dir("dir-b"));
         let files = LogFiles::new();
-        files.write(&first_dir, "web", "a").unwrap();
-        files.write(&second_dir, "web", "b").unwrap();
+        files.write(&first_dir, "client", "a").unwrap();
+        files.write(&second_dir, "client", "b").unwrap();
         files.flush();
         assert!(
-            fs::read_to_string(first_dir.join("logs").join("web.log"))
+            fs::read_to_string(first_dir.join("logs").join("client.log"))
                 .unwrap()
                 .contains("] a")
         );
         assert!(
-            fs::read_to_string(second_dir.join("logs").join("web.log"))
+            fs::read_to_string(second_dir.join("logs").join("client.log"))
                 .unwrap()
                 .contains("] b")
         );
