@@ -1,0 +1,16 @@
+[package]
+name = "ro-sppack"
+version = "0.1.0"
+edition = "2024"
+description = "Setup dashboard and one-click launcher for a self-hosted Ragnarok Online package (rust-ro server + roBrowserLegacy web client + asset server)"
+license = "MIT"
+
+[dependencies]
+eframe = { version = "0.30", default-features = false, features = ["glow", "default_fonts"] }
+egui = "0.30"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rfd = "0.15"
+
+[profile.release]
+opt-level = 2
