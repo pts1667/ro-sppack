@@ -75,16 +75,18 @@ standalone package.
   rust-ro/                  cloned server repository (config.json is regenerated)
   roBrowserLegacy/          cloned web client repository (built into dist/Web)
   remote-client/            cloned asset server repository and its release binary
-  ROenglishPRE/             optional English translation repository
-  translation.json          marker written after the translation is applied
+  ROenglishRE/              optional English translation (base, `Ragnarok/` subfolder)
+  ROenglishPRE/             optional English translation (pre-renewal overlay)
+  translation-re.json       marker written after ROenglishRE is applied
+  translation-pre.json      marker written after ROenglishPRE is applied
   webroot/                  runtime data owned by the launcher
     Config.local.js         generated client override (server address, ports, ...)
     .env                    generated remote client configuration
     resources/
       DATA.INI              generated archive manifest
       *.grf                 copied archives (or referenced in place)
-    data/                   loose overrides copied from the assets folder / auto-extracted
-    System/                 loose System/ overrides (translation, item info)
+    data/                   loose overrides: assets folder, translations, auto-extracted
+    System/                 loose System/ overrides (translations, item info)
     BGM/  AI/               only present when "copy" is enabled for them
   ro-sppack.json            launcher settings (working directory)
 ```
@@ -154,19 +156,25 @@ folder, auto-extraction of requested assets, `ENABLE_WSPROXY=false`.
   whenever something changes. If no file is there yet, a settings file left
   next to the executable by older builds is copied over automatically on first
   run.
-- **English translation.** On English systems the setup enables
-  [ROenglishPRE](https://github.com/zackdreaver/ROenglishPRE) by default: the
-  repository is cloned during install and its `data/` and `System/` trees are
-  copied over the package's loose client files. Most of it is Lua table (`.lub`)
-  and name/description `.txt` content, which the asset server serves before the
-  GRFs — no archive repacking is needed. Turn it off with *Install the English
-  translation* in Setup, or re-apply after an update with **Apply into data**.
+- **English translation.** On English systems the setup enables the fan
+  translation by default: [ROenglishRE](https://github.com/zackdreaver/ROenglishRE)
+  (base) is cloned and copied into the client data, then
+  [ROenglishPRE](https://github.com/zackdreaver/ROenglishPRE) is cloned and copied
+  on top of it, so the pre-renewal files win where the two overlap. Most of the
+  content is Lua table (`.lub`) and name/description/intro `.txt` files, which
+  the asset server serves before the GRFs — no archive repacking is needed.
+  Turn it off with *Install the English translation* in Setup, or re-apply after
+  an update with **Apply into data**.
 - **Ports in use.** Startup errors from rust-ro or the remote client appear in
   the Logs tab; change the ports in Setup and relaunch.
 - **Log files.** Everything in the Logs tab is also written to
   `<install dir>/logs`: `server.log`, `web.log` and `launcher.log` (setup jobs
   and launcher messages). Lines are flushed to disk about every 10 seconds, and
   the previous run's file is kept as `<name>.previous.log`.
+- **Server debug log.** Tick **Server debug log** in the Setup options to start
+  rust-ro with `--debug-log`, which also logs failed NPC conversations and
+  other script failures into `server.log`. It applies the next time the server
+  starts.
 
 ## Licensing
 

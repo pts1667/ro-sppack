@@ -260,6 +260,7 @@ impl App {
             "server",
             settings.server_bin(),
             settings.server_dir(),
+            settings.server_args(),
             Vec::new(),
         ) {
             self.server_pid = Some(pid);
@@ -301,7 +302,7 @@ impl App {
         }
         let env = config_gen::remote_client_env(&settings);
         if let Some(pid) =
-            self.spawn_managed("web", settings.remote_client_bin(), settings.webroot(), env)
+            self.spawn_managed("web", settings.remote_client_bin(), settings.webroot(), Vec::new(), env)
         {
             self.web_pid = Some(pid);
             self.web_started = Some(Instant::now());
@@ -322,10 +323,12 @@ impl App {
         name: &'static str,
         program: std::path::PathBuf,
         cwd: std::path::PathBuf,
+        args: Vec<String>,
         env: Vec<(String, String)>,
     ) -> Option<u32> {
         let mut command = Command::new(&program);
         command
+            .args(&args)
             .current_dir(&cwd)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -523,7 +526,7 @@ impl App {
                         ui,
                         "translation",
                         settings.translation_applied(),
-                        settings.translation_cloned(),
+                        settings.translation_re_cloned() && settings.translation_pre_cloned(),
                     );
                 }
                 ui.add_space(10.0);
@@ -704,10 +707,14 @@ impl App {
                         ui.end_row();
 
                         ui.label("Options");
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.checkbox(&mut self.settings.skip_intro, "Skip intro screen");
                             ui.checkbox(&mut self.settings.auto_open_browser, "Open browser on launch");
                             ui.checkbox(&mut self.settings.build_release, "Release build");
+                            ui.checkbox(&mut self.settings.debug_log, "Server debug log")
+                                .on_hover_text(
+                                    "Starts the server with --debug-log: logs failed NPC conversations and other script failures. Applies on the next server start.",
+                                );
                         });
                         ui.end_row();
                     });
@@ -1015,45 +1022,59 @@ impl App {
             }
         });
 
-        // Translation ------------------------------------------------------------
+        // Translations ------------------------------------------------------------
         if settings.install_translation {
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Translation · ROenglishPRE").strong());
-                state_chip_with(
-                    ui,
-                    settings.translation_applied(),
-                    settings.translation_cloned(),
-                    "applied",
-                    "cloned, not applied",
-                );
-            });
-            ui.label(
-                RichText::new(settings.translation_dir().display().to_string())
-                    .small()
-                    .color(MUTED),
-            );
-            if settings.translation_cloned() {
+            let layers = [
+                (
+                    "ROenglishRE (base)",
+                    settings.translation_re_dir(),
+                    settings.translation_re_source(),
+                    settings.translation_re_cloned(),
+                    settings.translation_re_applied(),
+                    settings.translation_re_marker(),
+                    "Apply English translation (ROenglishRE)",
+                ),
+                (
+                    "ROenglishPRE (overlay)",
+                    settings.translation_pre_dir(),
+                    settings.translation_pre_source(),
+                    settings.translation_pre_cloned(),
+                    settings.translation_pre_applied(),
+                    settings.translation_pre_marker(),
+                    "Apply English translation (ROenglishPRE)",
+                ),
+            ];
+            for (name, dir, source, cloned, applied, marker, label) in layers {
+                ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.button("Apply into data").clicked() {
-                        self.enqueue(
-                            "Apply English translation",
-                            JobKind::CopyTranslation {
-                                source: settings.translation_dir(),
-                                webroot: settings.webroot(),
-                                marker: settings.translation_marker(),
-                            },
-                        );
-                    }
-                    if ui.button("Update (git pull)").clicked() {
-                        self.enqueue(
-                            "Update English translation",
-                            JobKind::GitPull {
-                                dir: settings.translation_dir(),
-                            },
-                        );
-                    }
+                    ui.label(RichText::new(format!("Translation · {name}")).strong());
+                    state_chip_with(ui, applied, cloned, "applied", "cloned, not applied");
                 });
+                ui.label(
+                    RichText::new(dir.display().to_string())
+                        .small()
+                        .color(MUTED),
+                );
+                if cloned {
+                    ui.horizontal(|ui| {
+                        if ui.button("Apply into data").clicked() {
+                            self.enqueue(
+                                label,
+                                JobKind::CopyTranslation {
+                                    source: source.clone(),
+                                    webroot: settings.webroot(),
+                                    marker: marker.clone(),
+                                },
+                            );
+                        }
+                        if ui.button("Update (git pull)").clicked() {
+                            self.enqueue(
+                                format!("Update {name}"),
+                                JobKind::GitPull { dir: dir.clone() },
+                            );
+                        }
+                    });
+                }
             }
         }
     }

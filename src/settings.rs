@@ -36,6 +36,8 @@ pub struct Settings {
     pub skip_intro: bool,
     pub auto_open_browser: bool,
     pub build_release: bool,
+    /// Start the game server with `--debug-log` (script failure diagnostics).
+    pub debug_log: bool,
 
     pub asset_mode: AssetMode,
     pub copy_loose_data: bool,
@@ -45,9 +47,11 @@ pub struct Settings {
     pub client_repo: String,
     pub remote_client_repo: String,
 
-    /// Copy the ROenglishPRE fan translation over the client's loose data files.
+    /// Copy the ROenglishRE base translation and the ROenglishPRE overlay over
+    /// the client's loose data files.
     pub install_translation: bool,
-    pub translation_repo: String,
+    pub translation_re_repo: String,
+    pub translation_pre_repo: String,
 }
 
 impl Default for Settings {
@@ -68,6 +72,7 @@ impl Default for Settings {
             skip_intro: true,
             auto_open_browser: true,
             build_release: true,
+            debug_log: false,
             asset_mode: AssetMode::Copy,
             copy_loose_data: true,
             copy_bgm_ai: false,
@@ -76,7 +81,8 @@ impl Default for Settings {
             remote_client_repo: "https://github.com/Flux159/roBrowserLegacy-RemoteClient-Rust.git"
                 .into(),
             install_translation: system_language_is_english(),
-            translation_repo: "https://github.com/zackdreaver/ROenglishPRE.git".into(),
+            translation_re_repo: "https://github.com/zackdreaver/ROenglishRE.git".into(),
+            translation_pre_repo: "https://github.com/zackdreaver/ROenglishPRE.git".into(),
         }
     }
 }
@@ -115,6 +121,10 @@ impl Settings {
 
     // -- derived component paths -------------------------------------------------
 
+    pub fn server_args(&self) -> Vec<String> {
+        self.debug_log.then(|| "--debug-log".to_string()).into_iter().collect()
+    }
+
     pub fn server_dir(&self) -> PathBuf {
         self.install_dir.join("rust-ro")
     }
@@ -127,13 +137,31 @@ impl Settings {
         self.install_dir.join("remote-client")
     }
 
-    pub fn translation_dir(&self) -> PathBuf {
+    pub fn translation_re_dir(&self) -> PathBuf {
+        self.install_dir.join("ROenglishRE")
+    }
+
+    pub fn translation_pre_dir(&self) -> PathBuf {
         self.install_dir.join("ROenglishPRE")
     }
 
-    /// Marker written once the translation has been copied into the webroot.
-    pub fn translation_marker(&self) -> PathBuf {
-        self.install_dir.join("translation.json")
+    /// Directory that holds the ROenglishRE client files (`Ragnarok/data`, ...).
+    pub fn translation_re_source(&self) -> PathBuf {
+        self.translation_re_dir().join("Ragnarok")
+    }
+
+    /// Directory that holds the ROenglishPRE client files (`data`, `System`).
+    pub fn translation_pre_source(&self) -> PathBuf {
+        self.translation_pre_dir()
+    }
+
+    /// Marker written once a translation has been copied into the webroot.
+    pub fn translation_re_marker(&self) -> PathBuf {
+        self.install_dir.join("translation-re.json")
+    }
+
+    pub fn translation_pre_marker(&self) -> PathBuf {
+        self.install_dir.join("translation-pre.json")
     }
 
     pub fn webroot(&self) -> PathBuf {
@@ -218,13 +246,25 @@ impl Settings {
         self.remote_client_dir().join("Cargo.toml").is_file()
     }
 
-    pub fn translation_cloned(&self) -> bool {
-        self.translation_dir().join("data").is_dir()
+    pub fn translation_re_cloned(&self) -> bool {
+        self.translation_re_source().join("data").is_dir()
     }
 
-    /// True once the translation files were copied over the webroot data.
+    pub fn translation_pre_cloned(&self) -> bool {
+        self.translation_pre_dir().join("data").is_dir()
+    }
+
+    /// True once both translation layers were copied over the webroot data.
     pub fn translation_applied(&self) -> bool {
-        self.translation_marker().is_file()
+        self.translation_re_marker().is_file() && self.translation_pre_marker().is_file()
+    }
+
+    pub fn translation_re_applied(&self) -> bool {
+        self.translation_re_marker().is_file()
+    }
+
+    pub fn translation_pre_applied(&self) -> bool {
+        self.translation_pre_marker().is_file()
     }
 
     pub fn server_built(&self) -> bool {
@@ -258,4 +298,23 @@ pub fn system_language_is_english() -> bool {
     sys_locale::get_locale()
         .map(|locale| locale.to_ascii_lowercase().starts_with("en"))
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod debug_log_tests {
+    use super::Settings;
+
+    #[test]
+    fn server_gets_the_debug_log_flag_only_when_enabled() {
+        let mut settings = Settings::default();
+        assert!(settings.server_args().is_empty());
+        settings.debug_log = true;
+        assert_eq!(settings.server_args(), ["--debug-log"]);
+    }
+
+    #[test]
+    fn settings_files_without_the_option_keep_it_off() {
+        let settings: Settings = serde_json::from_str(r#"{"game_port": 7000}"#).unwrap();
+        assert!(!settings.debug_log);
+    }
 }

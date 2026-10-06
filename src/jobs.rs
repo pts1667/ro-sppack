@@ -496,16 +496,27 @@ pub fn install_plan(settings: &Settings, force: bool) -> Vec<(String, JobKind)> 
         have_remote = true;
     }
 
-    let mut have_translation = settings.translation_cloned();
-    if settings.install_translation && !have_translation {
+    let mut have_translation_re = settings.translation_re_cloned();
+    if settings.install_translation && !have_translation_re {
         plan.push((
-            "Clone English translation".to_string(),
+            "Clone English translation (ROenglishRE)".to_string(),
             JobKind::GitClone {
-                url: settings.translation_repo.clone(),
-                dest: settings.translation_dir(),
+                url: settings.translation_re_repo.clone(),
+                dest: settings.translation_re_dir(),
             },
         ));
-        have_translation = true;
+        have_translation_re = true;
+    }
+    let mut have_translation_pre = settings.translation_pre_cloned();
+    if settings.install_translation && !have_translation_pre {
+        plan.push((
+            "Clone English translation (ROenglishPRE)".to_string(),
+            JobKind::GitClone {
+                url: settings.translation_pre_repo.clone(),
+                dest: settings.translation_pre_dir(),
+            },
+        ));
+        have_translation_pre = true;
     }
 
     if have_server && (force || !settings.server_built()) {
@@ -555,16 +566,31 @@ pub fn install_plan(settings: &Settings, force: bool) -> Vec<(String, JobKind)> 
             },
         ));
     }
+    // ROenglishRE is the base translation; ROenglishPRE is layered on top so
+    // its pre-renewal files win wherever the two overlap. Order matters.
     if settings.install_translation
-        && have_translation
-        && (force || !settings.translation_applied())
+        && have_translation_re
+        && (force || !settings.translation_re_applied())
     {
         plan.push((
-            "Apply English translation".to_string(),
+            "Apply English translation (ROenglishRE)".to_string(),
             JobKind::CopyTranslation {
-                source: settings.translation_dir(),
+                source: settings.translation_re_source(),
                 webroot: settings.webroot(),
-                marker: settings.translation_marker(),
+                marker: settings.translation_re_marker(),
+            },
+        ));
+    }
+    if settings.install_translation
+        && have_translation_pre
+        && (force || !settings.translation_pre_applied())
+    {
+        plan.push((
+            "Apply English translation (ROenglishPRE)".to_string(),
+            JobKind::CopyTranslation {
+                source: settings.translation_pre_source(),
+                webroot: settings.webroot(),
+                marker: settings.translation_pre_marker(),
             },
         ));
     }
@@ -637,10 +663,14 @@ mod tests {
     }
 
     #[test]
-    fn install_plan_covers_translation_only_when_enabled() {
+    fn install_plan_layers_translations_re_then_pre() {
         let mut settings = Settings::default();
         assert_eq!(
-            settings.translation_repo,
+            settings.translation_re_repo,
+            "https://github.com/zackdreaver/ROenglishRE.git"
+        );
+        assert_eq!(
+            settings.translation_pre_repo,
             "https://github.com/zackdreaver/ROenglishPRE.git"
         );
 
@@ -649,16 +679,31 @@ mod tests {
             .into_iter()
             .map(|(label, _)| label)
             .collect();
-        assert!(labels.contains(&"Clone English translation".to_string()));
-        assert!(labels.contains(&"Apply English translation".to_string()));
+        let re = labels
+            .iter()
+            .position(|label| label == "Apply English translation (ROenglishRE)")
+            .expect("ROenglishRE should be applied");
+        let pre = labels
+            .iter()
+            .position(|label| label == "Apply English translation (ROenglishPRE)")
+            .expect("ROenglishPRE should be applied");
+        assert!(re < pre, "ROenglishRE must be applied before ROenglishPRE");
 
         settings.install_translation = false;
         let labels: Vec<String> = install_plan(&settings, false)
             .into_iter()
             .map(|(label, _)| label)
             .collect();
-        assert!(!labels.contains(&"Clone English translation".to_string()));
-        assert!(!labels.contains(&"Apply English translation".to_string()));
+        assert!(
+            !labels
+                .iter()
+                .any(|label| label.starts_with("Clone English"))
+        );
+        assert!(
+            !labels
+                .iter()
+                .any(|label| label.starts_with("Apply English"))
+        );
     }
 
     /// Requires git, cargo and Node/npm to be installed. Run with:

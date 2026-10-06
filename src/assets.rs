@@ -228,23 +228,11 @@ pub fn copy_translation(
         ));
     }
 
-    // A same-size file may still have new contents after a `git pull`, so stale
-    // copies are only skipped when they are at least as new as the source.
+    // Translations are layered (ROenglishPRE over ROenglishRE) and a file may be
+    // replaced by different content of the same size, so every file is rewritten.
+    // The marker file makes repeat runs of an already-applied layer unnecessary.
     for task in &mut tasks {
-        if !task.skip {
-            continue;
-        }
-        let source_time = fs::metadata(&task.src)
-            .and_then(|meta| meta.modified())
-            .ok();
-        let dest_time = fs::metadata(&task.dst)
-            .and_then(|meta| meta.modified())
-            .ok();
-        if let (Some(source_time), Some(dest_time)) = (source_time, dest_time)
-            && dest_time < source_time
-        {
-            task.skip = false;
-        }
+        task.skip = false;
     }
 
     let total: u64 = tasks.iter().map(|task| task.size).sum();
@@ -582,9 +570,27 @@ mod tests {
         );
         assert!(marker.is_file());
 
-        // Re-running without source changes copies nothing.
+        // Same-size changes still win (this is how the PRE layer overrides RE).
+        fs::write(
+            source
+                .join("data")
+                .join("lua files")
+                .join("skillinfolist.lub"),
+            "LUB DATA",
+        )
+        .unwrap();
         let summary = copy_translation(2, &source, &webroot, &marker, &tx, &ctx, &cancel).unwrap();
-        assert!(summary.contains("0 updated"), "{summary}");
+        assert!(summary.contains("3 updated"), "{summary}");
+        assert_eq!(
+            fs::read_to_string(
+                webroot
+                    .join("data")
+                    .join("lua files")
+                    .join("skillinfolist.lub")
+            )
+            .unwrap(),
+            "LUB DATA"
+        );
         fs::remove_dir_all(&root).ok();
     }
 
