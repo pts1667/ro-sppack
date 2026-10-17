@@ -48,6 +48,10 @@ fn generate_server_config(settings: &Settings) -> Result<(), String> {
         .map_err(|e| format!("read {} (is rust-ro cloned?): {e}", template_path.display()))?;
     let mut config: Value = serde_json::from_str(&text)
         .map_err(|e| format!("parse {}: {e}", template_path.display()))?;
+    // The overrides go in first: what the menu sets below wins over them.
+    for (key, value) in settings.server_overrides()? {
+        merge(&mut config[key.as_str()], value);
+    }
 
     let server = config
         .get_mut("server")
@@ -82,7 +86,12 @@ fn generate_server_config(settings: &Settings) -> Result<(), String> {
         config["game"]["drop_rate_card"] = json!(settings.drop_rate_card);
         config["game"]["drop_rate_mvp"] = json!(settings.drop_rate_mvp);
         config["game"]["mob_density"] = json!(settings.mob_density);
+        config["game"]["sim_speed"] = json!(settings.sim_speed);
+        config["game"]["max_base_level"] = json!(settings.max_base_level);
+        config["game"]["max_stat_level"] = json!(settings.max_stat_level);
     }
+    config["char_server"]["server_name"] = json!(settings.server_name.trim());
+    config["login"]["new_account"] = json!(settings.account_registration);
 
     // Logins from this computer need no account: the client asks only for a name.
     config["login"]["skip_account_ips"] = json!(settings.ip_login_addresses());
@@ -98,9 +107,10 @@ fn generate_server_config(settings: &Settings) -> Result<(), String> {
     config["reference"]["enabled"] = json!(true);
     config["reference"]["port"] = json!(settings.reference_port);
     if settings.bot_api_enabled {
-        // The bots take turns with a pool of twice their number (`--pool`): every character of
-        // the pool must fit in `max_registered_bots`, and `max_bots` leaves room to spare.
-        let room = settings.bot_count as u64 * 2;
+        // The bots take turns with their pool (`--pool`, twice their number by default): every
+        // character of the pool must fit in `max_registered_bots`, and `max_bots` leaves room for
+        // the bots logging off while others join.
+        let room = u64::from(settings.bot_pool_size()).max(u64::from(settings.bot_count) * 2);
         for key in ["max_bots", "max_registered_bots"] {
             let current = config["bots"][key].as_u64().unwrap_or(0);
             config["bots"][key] = json!(current.max(room));
@@ -112,6 +122,18 @@ fn generate_server_config(settings: &Settings) -> Result<(), String> {
         serde_json::to_string_pretty(&config).map_err(|e| format!("serialize config: {e}"))?;
     std::fs::write(&config_path, pretty)
         .map_err(|e| format!("write {}: {e}", config_path.display()))
+}
+
+/// Merges `value` into `target`: objects key by key, anything else replaces what is there.
+fn merge(target: &mut Value, value: Value) {
+    match (target, value) {
+        (Value::Object(target), Value::Object(value)) => {
+            for (key, value) in value {
+                merge(target.entry(key).or_insert(Value::Null), value);
+            }
+        }
+        (target, value) => *target = value,
+    }
 }
 
 fn generate_client_config(settings: &Settings) -> Result<(), String> {
@@ -249,7 +271,10 @@ mod tests {
         assert_eq!(config["reference"]["port"], json!(6904));
         assert_eq!(config["reference"]["wiki_root"], json!("wiki"));
         assert_eq!(config["login"]["skip_account_ips"], json!(["127.0.0.1"]));
-        assert_eq!(config["login"]["new_account"], json!(true));
+        assert_eq!(config["login"]["new_account"], json!(false));
+        assert_eq!(config["game"]["sim_speed"], json!(1.0));
+        assert_eq!(config["game"]["max_base_level"], json!(99));
+        assert_eq!(config["char_server"]["server_name"], json!("Rust ragnarok"));
 
         let written = std::fs::read_to_string(settings.client_config_json()).unwrap();
         let config: Value = serde_json::from_str(&written).unwrap();
@@ -263,6 +288,34 @@ mod tests {
         assert_eq!(config["data_dir"], json!("data/extracted"));
         // Untouched fields written by the client are preserved.
         assert_eq!(config["dpi_scale"], json!(150.0));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn overrides_reach_the_server_config_but_the_menu_wins() {
+        let (root, mut settings) = install("overrides");
+        settings.sim_speed = 4.0;
+        settings.server_overrides =
+            r#"{"game": {"pvp_exp": true, "sim_speed": 9.0}, "char_server": {"start_zeny": 500}}"#
+                .into();
+        generate_all(&settings).unwrap();
+
+        let written = std::fs::read_to_string(settings.server_config_json()).unwrap();
+        let config: Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(config["game"]["pvp_exp"], json!(true));
+        assert_eq!(config["game"]["sim_speed"], json!(4.0));
+        assert_eq!(config["char_server"]["start_zeny"], json!(500));
+        // Keys of a merged section the overrides leave alone are kept.
+        assert_eq!(config["game"]["mob_density"], json!(1.0));
+
+        // A bot pool larger than twice the bots raises the registered room.
+        settings.server_overrides.clear();
+        settings.bot_pool = Some(250);
+        generate_all(&settings).unwrap();
+        let written = std::fs::read_to_string(settings.server_config_json()).unwrap();
+        let config: Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(config["bots"]["max_registered_bots"], json!(250));
 
         std::fs::remove_dir_all(&root).ok();
     }

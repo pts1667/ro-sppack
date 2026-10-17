@@ -293,6 +293,9 @@ impl App {
                         ui.label(RichText::new("Bots").color(TEXT_DIM));
                         ui.label(RichText::new(bots).color(bots_color));
                         ui.end_row();
+                        ui.label(RichText::new("Model").color(TEXT_DIM));
+                        ui.label(RichText::new(settings.bot_model.label()).color(TEXT));
+                        ui.end_row();
                         ui.label(RichText::new("Rates").color(TEXT_DIM));
                         ui.label(RichText::new(rates).color(TEXT));
                         ui.end_row();
@@ -702,7 +705,11 @@ impl App {
                 .show(ui, |ui| {
                     match page {
                         Page::General => self.general_page(ui),
-                        Page::Server => self.server_page(ui),
+                        Page::Server => {
+                            self.server_page(ui);
+                            self.server_overrides_ui(ui);
+                        }
+                        Page::Bots => self.bots_page(ui),
                         Page::Components => self.components_page(ui),
                         Page::Processes => self.dashboard_tab(ui),
                         Page::Logs => {}

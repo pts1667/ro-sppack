@@ -15,6 +15,82 @@ pub const PORT_RANGE: RangeInclusive<f64> = 1.0..=65535.0;
 /// Accepted range for the bots playing at once. Each takes turns with a resting character, and
 /// rust-ro-bot's `names.txt` holds 640 names.
 pub const BOT_COUNT_RANGE: RangeInclusive<f64> = 1.0..=300.0;
+/// Game time per real time (`game.sim_speed`): above 1 timers, mobs and skills run faster.
+pub const SIM_SPEED_RANGE: RangeInclusive<f64> = 0.1..=100.0;
+/// Accepted range for the base level and stat caps.
+pub const LEVEL_RANGE: RangeInclusive<f64> = 1.0..=999.0;
+/// Accepted range for the bots' pool, the characters taking turns.
+pub const BOT_POOL_RANGE: RangeInclusive<f64> = 1.0..=640.0;
+/// Accepted range for a bot session, in minutes.
+pub const BOT_SESSION_RANGE: RangeInclusive<f64> = 1.0..=1440.0;
+/// Accepted range for the seconds between two bots joining, and between two strategist steps.
+pub const BOT_SECONDS_RANGE: RangeInclusive<f64> = 0.0..=3600.0;
+/// Accepted range for the LLM's thinking budget, in tokens.
+pub const LLM_THINK_RANGE: RangeInclusive<f64> = 0.0..=65536.0;
+/// Accepted range for the LLM temperature.
+pub const LLM_TEMPERATURE_RANGE: RangeInclusive<f64> = 0.0..=2.0;
+/// Accepted range for the share of strategist steps that go to the model.
+pub const SHARE_RANGE: RangeInclusive<f64> = 0.0..=1.0;
+
+/// Who the bots talk with, and who takes the model's share of their goal choices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BotModel {
+    /// The decision model (`--voice system-one`): sentences from a catalogue, a quarter of the goal
+    /// choices by default.
+    DecisionModel,
+    /// The LLM (`--voice llm`): chat in its own words, every goal choice by default.
+    Llm,
+    /// No model (`--no-llm`): the rules pick the goals, and the bots neither chat nor post.
+    None,
+}
+
+impl BotModel {
+    pub const ALL: [BotModel; 3] = [BotModel::DecisionModel, BotModel::Llm, BotModel::None];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BotModel::DecisionModel => "Decision model",
+            BotModel::Llm => "LLM",
+            BotModel::None => "None (rules only)",
+        }
+    }
+
+    /// The default share of strategist steps that go to the model.
+    pub fn default_share(self) -> f32 {
+        match self {
+            BotModel::DecisionModel => 0.25,
+            BotModel::Llm => 1.0,
+            BotModel::None => 0.0,
+        }
+    }
+}
+
+/// How the LLM strategist keeps context between steps (`--context`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BotContext {
+    /// A fresh prompt each step; only the validated state is carried over.
+    SkillState,
+    /// One conversation for the whole run, compacted by the model when it grows long.
+    History,
+}
+
+impl BotContext {
+    pub fn label(self) -> &'static str {
+        match self {
+            BotContext::SkillState => "Fresh prompt each step",
+            BotContext::History => "One conversation",
+        }
+    }
+
+    fn arg(self) -> &'static str {
+        match self {
+            BotContext::SkillState => "skill-state",
+            BotContext::History => "history",
+        }
+    }
+}
 
 /// Settings are stored in `ro-sppack.json` in the current working directory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,6 +126,48 @@ pub struct Settings {
     pub launch_bots: bool,
     /// Bots playing at once (`--bots`).
     pub bot_count: u32,
+    pub bot_model: BotModel,
+    /// The decision model's llama.cpp server (`--s1-url`).
+    pub bot_decision_url: String,
+    /// The LLM's llama.cpp server (`--llm-url`), and the model name sent to it.
+    pub bot_llm_url: String,
+    pub bot_llm_model: String,
+    /// Tokens the LLM may think before an answer (`--llm-think`); 0 turns thinking off.
+    pub bot_llm_think: u32,
+    pub bot_llm_temperature: f32,
+    pub bot_context: BotContext,
+    /// Share of the goal choices that go to the model (`--llm-share`); `None` keeps the bots'
+    /// default for the model.
+    pub bot_model_share: Option<f32>,
+    /// Bots log off after a session of `bot_session_min`..`bot_session_max` minutes and a resting
+    /// character takes their place. Without it every bot stays in the game (`--session 0`).
+    pub bot_sessions: bool,
+    pub bot_session_min: u32,
+    pub bot_session_max: u32,
+    /// Characters taking turns (`--pool`); `None` is twice the bots.
+    pub bot_pool: Option<u32>,
+    /// Seconds between two bots joining (`--join-gap`).
+    pub bot_join_gap: u32,
+    /// Seconds between two strategist steps when nothing happens (`--strategist-period`).
+    pub bot_strategist_period: u32,
+    /// Bots with a voice visit the players' forum (`--no-forum` when off).
+    pub bot_forum: bool,
+    /// Bots play alone: no parties (`--solo`).
+    pub bot_solo: bool,
+    /// More `rust-ro-bot run` arguments, separated by spaces.
+    pub bot_extra_args: String,
+
+    /// Game time per real time (`game.sim_speed`).
+    pub sim_speed: f32,
+    pub max_base_level: u32,
+    pub max_stat_level: u32,
+    /// `char_server.server_name`, shown in the server list.
+    pub server_name: String,
+    /// `login.new_account`: names ending in `_M`/`_F` (and a client's Register screen) create accounts.
+    pub account_registration: bool,
+    /// A JSON object merged into the server's config.json before the menu's values are written:
+    /// every other server option. Empty for none.
+    pub server_overrides: String,
 
     pub build_release: bool,
     /// "Play without updating": the launcher does not pull and rebuild when it starts. An install
@@ -90,6 +208,29 @@ impl Default for Settings {
             ip_login: true,
             launch_bots: true,
             bot_count: 50,
+            bot_model: BotModel::DecisionModel,
+            bot_decision_url: "http://127.0.0.1:9931".into(),
+            bot_llm_url: "http://127.0.0.1:8080".into(),
+            bot_llm_model: "local-model".into(),
+            bot_llm_think: 2048,
+            bot_llm_temperature: 0.3,
+            bot_context: BotContext::SkillState,
+            bot_model_share: None,
+            bot_sessions: true,
+            bot_session_min: 30,
+            bot_session_max: 60,
+            bot_pool: None,
+            bot_join_gap: 3,
+            bot_strategist_period: 45,
+            bot_forum: true,
+            bot_solo: false,
+            bot_extra_args: String::new(),
+            sim_speed: 1.0,
+            max_base_level: 99,
+            max_stat_level: 99,
+            server_name: "Rust ragnarok".into(),
+            account_registration: false,
+            server_overrides: String::new(),
             build_release: true,
             skip_update: false,
             debug_log: false,
@@ -187,18 +328,101 @@ impl Settings {
         self.server_dir().join("config").join("bots_api_key.txt")
     }
 
-    /// `rust-ro-bot run` with its defaults (the decision model as the bots' voice, characters taking
-    /// turns). `--server-dir` reads the Bot API and reference addresses and the API key from the
-    /// server's config.json; `--stop-on-stdin` lets the launcher log them out with a line `stop`.
+    /// `rust-ro-bot run` with the Bots settings. `--server-dir` reads the Bot API and reference
+    /// addresses and the API key from the server's config.json; `--stop-on-stdin` lets the launcher
+    /// log them out with a line `stop`.
     pub fn bot_args(&self) -> Vec<String> {
-        vec![
+        let mut args: Vec<String> = vec![
             "run".into(),
             "--bots".into(),
             self.bot_count.to_string(),
             "--server-dir".into(),
             self.server_dir().display().to_string(),
             "--stop-on-stdin".into(),
-        ]
+        ];
+        let mut push = |name: &str, value: String| {
+            args.push(name.into());
+            args.push(value);
+        };
+        match self.bot_model {
+            BotModel::DecisionModel => {
+                push("--voice", "system-one".into());
+                push("--s1-url", self.bot_decision_url.trim().into());
+            }
+            BotModel::Llm => {
+                push("--voice", "llm".into());
+                push("--llm-url", self.bot_llm_url.trim().into());
+                push("--llm-model", self.bot_llm_model.trim().into());
+                push("--llm-think", self.bot_llm_think.to_string());
+                push("--llm-temp", self.bot_llm_temperature.to_string());
+                push("--context", self.bot_context.arg().into());
+            }
+            BotModel::None => args.push("--no-llm".into()),
+        }
+        let mut push = |name: &str, value: String| {
+            args.push(name.into());
+            args.push(value);
+        };
+        if self.bot_model != BotModel::None
+            && let Some(share) = self.bot_model_share
+        {
+            push("--llm-share", share.to_string());
+        }
+        if self.bot_sessions {
+            push(
+                "--session",
+                format!("{}-{}", self.bot_session_min, self.bot_session_max),
+            );
+            push("--pool", self.bot_pool_size().to_string());
+        } else {
+            push("--session", "0".into());
+        }
+        push("--join-gap", self.bot_join_gap.to_string());
+        push(
+            "--strategist-period",
+            self.bot_strategist_period.to_string(),
+        );
+        if !self.bot_forum {
+            args.push("--no-forum".into());
+        }
+        if self.bot_solo {
+            args.push("--solo".into());
+        }
+        args.extend(self.bot_extra_args.split_whitespace().map(String::from));
+        args
+    }
+
+    /// Characters the bots play: the pool when they take turns (twice the bots unless set, never
+    /// fewer than the bots), else the bots themselves.
+    pub fn bot_pool_size(&self) -> u32 {
+        if !self.bot_sessions {
+            return self.bot_count;
+        }
+        self.bot_pool
+            .unwrap_or(self.bot_count * 2)
+            .max(self.bot_count)
+    }
+
+    /// The model server the bots use, if any.
+    pub fn bot_model_url(&self) -> Option<&str> {
+        match self.bot_model {
+            BotModel::DecisionModel => Some(self.bot_decision_url.trim()),
+            BotModel::Llm => Some(self.bot_llm_url.trim()),
+            BotModel::None => None,
+        }
+    }
+
+    /// The server overrides as a JSON object; empty text is no overrides.
+    pub fn server_overrides(&self) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+        let text = self.server_overrides.trim();
+        if text.is_empty() {
+            return Ok(serde_json::Map::new());
+        }
+        match serde_json::from_str::<serde_json::Value>(text) {
+            Ok(serde_json::Value::Object(map)) => Ok(map),
+            Ok(_) => Err("Server overrides must be a JSON object, like {\"game\": {...}}".into()),
+            Err(error) => Err(format!("Server overrides are not valid JSON: {error}")),
+        }
     }
 
     /// Loose translation files the client reads before the server's data (the client's `data/`).
@@ -386,6 +610,33 @@ impl Settings {
         check_range("Mob density", self.mob_density, &MOB_DENSITY_RANGE)?;
         check_range("Packet version", self.packetver, &PACKETVER_RANGE)?;
         check_range("Bot count", self.bot_count, &BOT_COUNT_RANGE)?;
+        check_range("Simulation speed", self.sim_speed, &SIM_SPEED_RANGE)?;
+        check_range("Max base level", self.max_base_level, &LEVEL_RANGE)?;
+        check_range("Max stat level", self.max_stat_level, &LEVEL_RANGE)?;
+        if let Some(pool) = self.bot_pool {
+            check_range("Bot pool", pool, &BOT_POOL_RANGE)?;
+        }
+        check_range("Shortest session", self.bot_session_min, &BOT_SESSION_RANGE)?;
+        check_range("Longest session", self.bot_session_max, &BOT_SESSION_RANGE)?;
+        if self.bot_session_min > self.bot_session_max {
+            return Err("the shortest bot session is longer than the longest".into());
+        }
+        check_range("Join gap", self.bot_join_gap, &BOT_SECONDS_RANGE)?;
+        check_range(
+            "Strategist period",
+            self.bot_strategist_period,
+            &BOT_SECONDS_RANGE,
+        )?;
+        check_range("LLM thinking budget", self.bot_llm_think, &LLM_THINK_RANGE)?;
+        check_range(
+            "LLM temperature",
+            self.bot_llm_temperature,
+            &LLM_TEMPERATURE_RANGE,
+        )?;
+        if let Some(share) = self.bot_model_share {
+            check_range("Model share", share, &SHARE_RANGE)?;
+        }
+        self.server_overrides()?;
 
         let mut ports = vec![
             ("Game port", self.game_port),
@@ -563,7 +814,7 @@ mod debug_log_tests {
 
 #[cfg(test)]
 mod bot_tests {
-    use super::Settings;
+    use super::{BotModel, Settings};
 
     #[test]
     fn logins_from_this_computer_skip_the_account_system() {
@@ -597,6 +848,95 @@ mod bot_tests {
         assert!(args.iter().any(|arg| arg == "--stop-on-stdin"));
         assert!(settings.server_ports().contains(&7002));
         assert!(settings.server_ports().contains(&7004));
+    }
+
+    #[test]
+    fn the_bots_get_their_model_and_play_settings() {
+        let defaults = Settings::default().bot_args();
+        let value = |args: &[String], name: &str| {
+            let index = args.iter().position(|arg| arg == name)?;
+            args.get(index + 1).cloned()
+        };
+        assert_eq!(value(&defaults, "--voice").as_deref(), Some("system-one"));
+        assert_eq!(
+            value(&defaults, "--s1-url").as_deref(),
+            Some("http://127.0.0.1:9931")
+        );
+        assert_eq!(value(&defaults, "--session").as_deref(), Some("30-60"));
+        assert_eq!(value(&defaults, "--pool").as_deref(), Some("100"));
+        assert_eq!(value(&defaults, "--llm-share"), None);
+        assert!(
+            !defaults
+                .iter()
+                .any(|arg| arg == "--llm-url" || arg == "--no-forum")
+        );
+
+        let llm = Settings {
+            bot_model: BotModel::Llm,
+            bot_llm_url: " http://10.0.0.2:8080 ".into(),
+            bot_model_share: Some(0.5),
+            bot_sessions: false,
+            bot_forum: false,
+            bot_solo: true,
+            bot_extra_args: "--role healer  --job Priest".into(),
+            ..Settings::default()
+        };
+        let args = llm.bot_args();
+        assert_eq!(value(&args, "--voice").as_deref(), Some("llm"));
+        assert_eq!(
+            value(&args, "--llm-url").as_deref(),
+            Some("http://10.0.0.2:8080")
+        );
+        assert_eq!(value(&args, "--context").as_deref(), Some("skill-state"));
+        assert_eq!(value(&args, "--llm-share").as_deref(), Some("0.5"));
+        assert_eq!(value(&args, "--session").as_deref(), Some("0"));
+        assert_eq!(value(&args, "--pool"), None);
+        assert_eq!(llm.bot_pool_size(), 50);
+        assert!(args.iter().any(|arg| arg == "--no-forum"));
+        assert!(args.iter().any(|arg| arg == "--solo"));
+        assert_eq!(
+            args[args.len() - 4..],
+            ["--role", "healer", "--job", "Priest"]
+        );
+
+        let silent = Settings {
+            bot_model: BotModel::None,
+            bot_model_share: Some(0.5),
+            ..Settings::default()
+        };
+        let args = silent.bot_args();
+        assert!(args.iter().any(|arg| arg == "--no-llm"));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "--voice" || arg == "--llm-share")
+        );
+        assert_eq!(silent.bot_model_url(), None);
+    }
+
+    #[test]
+    fn a_small_pool_still_seats_every_bot() {
+        let settings = Settings {
+            bot_count: 40,
+            bot_pool: Some(10),
+            ..Settings::default()
+        };
+        assert_eq!(settings.bot_pool_size(), 40);
+    }
+
+    #[test]
+    fn server_overrides_must_be_a_json_object() {
+        let mut settings = Settings::default();
+        assert!(settings.validate().is_ok());
+        settings.server_overrides = r#"{"game": {"pvp_exp": true}}"#.into();
+        assert_eq!(
+            settings.server_overrides().unwrap()["game"]["pvp_exp"],
+            true
+        );
+        settings.server_overrides = "[1, 2]".into();
+        assert!(settings.validate().is_err());
+        settings.server_overrides = "{".into();
+        assert!(settings.validate().is_err());
     }
 
     #[test]

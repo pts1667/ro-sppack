@@ -38,7 +38,7 @@ the client and the bots.
    **Settings → General** and:
    - choose an **Install folder** (created if missing),
    - choose your **Assets folder** (the client root with `DATA.INI` + GRFs),
-   - adjust rates/ports under **Server & bots** if you like.
+   - adjust the server under **Server** and the bots under **Bots** if you like.
 
    Then close the menu and press **INSTALL**. The update bar shows each step
    ("Step 4 of 10 · Compiling …"), and every command's output goes to **Logs**:
@@ -83,7 +83,7 @@ changed, and the commits in use are shown under the button.
 
 ## Login
 
-With **Login: by IP** ticked in **Settings → Server & bots** (the default),
+With **Login: by IP** ticked in **Settings → Server** (the default),
 the server config lists this computer in `login.skip_account_ips`: `127.0.0.1`,
 and for LAN play the advertised host when it is an IPv4 address. Logins from
 those addresses need no password; the client asks the server
@@ -95,14 +95,33 @@ rAthena/Hercules installation and are not available in this standalone package.
 
 ## Bots
 
-With **Bots: start with the server** ticked (the default), the launcher starts
-`rust-ro-bot run --bots 50 --server-dir <install>/rust-ro --stop-on-stdin` as
+With **Start: with the server** ticked in **Settings → Bots** (the default),
+the launcher starts
+`rust-ro-bot run --bots 50 --server-dir <install>/rust-ro --stop-on-stdin …` as
 soon as the server's game, client data, reference and Bot API ports accept
 connections. With `--server-dir`, the bots take the Bot API and reference
 addresses and the API key from the server's `config.json`, so they follow
-whatever the launcher wrote there. The bots use their default voice, the
-decision model at `127.0.0.1:9931`; when it does not answer, they play by the
-rules alone and don't chat.
+whatever the launcher wrote there.
+
+The Bots page sets the rest of the command line; changes apply the next time
+the bots start:
+
+| Setting | Default | Argument |
+| --- | --- | --- |
+| Model | Decision model | `--voice system-one`, `--voice llm`, or `--no-llm` for none (the rules pick the goals; no chat, no forum) |
+| Decision model server | `http://127.0.0.1:9931` | `--s1-url` |
+| LLM server, model name, thinking budget, temperature | `http://127.0.0.1:8080`, `local-model`, 2048 tokens, 0.3 | `--llm-url`, `--llm-model`, `--llm-think`, `--llm-temp` |
+| Strategist memory (LLM) | fresh prompt each step | `--context skill-state` / `history` |
+| Model share of the goal choices | the bots' default: 0.25 decision model, 1 LLM | `--llm-share` |
+| Sessions | take turns, 30 to 60 minutes | `--session 30-60`, or `0` to stay in the game |
+| Pool | twice the bots | `--pool` |
+| Join gap, strategist period | 3 s, 45 s | `--join-gap`, `--strategist-period` |
+| Visit the forum, solo | on, off | `--no-forum`, `--solo` |
+| Extra arguments | none | anything else of `rust-ro-bot run --help`, e.g. `--role healer` |
+
+**Check** next to a server address tries to connect to it. A model server that
+does not answer is no error: the bots then play by the rules alone and don't
+chat.
 
 - **Stopping logs the bots out cleanly.** The launcher sends them `stop` on
   their stdin: each finishes its step, saves its memory and leaves the game.
@@ -114,8 +133,8 @@ rules alone and don't chat.
 - A run that was killed anyway leaves no characters behind for long: the next
   run logs out the resting characters of its pool that are still in the game.
 - The server config gets `bots.max_bots` and `bots.max_registered_bots` of at
-  least twice the bot count: the characters take turns with a pool of twice the
-  bots, and every one of them must be registered.
+  least twice the bot count, and at least the pool: every character of the pool
+  must be registered.
 - The **Bots** card in Settings → Processes and the **Run** button in Components start and
   stop them by hand while the server runs.
 - Their output goes to the Logs tab and `logs/bots.log`.
@@ -169,10 +188,19 @@ ro-sppack.exe --setup > setup.log 2>&1
 - the seeded account `2000000` appended to `server.accounts`,
 - `login.skip_account_ips` (see [Login](#login)),
 - `game.*` rates (base/job EXP, drop, card drop, MVP drop, mob density),
+  `game.sim_speed` (**Simulation speed**: game time per real time, 1 by default),
+  `game.max_base_level` and `game.max_stat_level`,
+- `char_server.server_name` and `login.new_account` (**Registration**),
 - `client_data` (the `/data` endpoint: port 6903 by default, bound to the bind host),
 - `bots` (the bot API: enabled flag and port 6902 by default; with the API
   on, `max_bots` and `max_registered_bots` of at least twice the bot count),
 - `reference` (`/db` and `/wiki`, which the bots plan with: enabled, port 6904 by default).
+
+`config.json` is written from the template each time, so edit other server
+options under **More server options** on the Server page: a JSON object such
+as `{"game": {"pvp_exp": true}, "char_server": {"start_zeny": 1000}}`, merged
+over the template before the values above are written (those win). Invalid JSON
+keeps the configuration from being written and is shown in red.
 
 **`nostalro-client/config.json`** — the launcher only patches the fields it
 owns and preserves everything else the client wrote (window state, keybindings,
@@ -226,7 +254,7 @@ volumes, graphic options):
   next to the executable by older builds is copied over automatically on first
   run.
 - **Ports in use.** Startup errors from rust-ro or the client appear in the
-  Logs; change the game port in Settings → Server & bots and relaunch.
+  Logs; change the game port in Settings → Server and relaunch.
 - **Log files.** Everything in the Logs tab is also written to
   `<install dir>/logs`: `server.log`, `client.log` and `launcher.log` (setup
   jobs and launcher messages). Lines are flushed to disk about every 10

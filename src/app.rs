@@ -9,7 +9,9 @@ use crate::events::{AppEvent, LogLevel};
 use crate::jobs::{JobKind, JobRunner, kill_pid};
 use crate::log_files::LogFiles;
 use crate::settings::{
-    BOT_COUNT_RANGE, MOB_DENSITY_RANGE, PACKETVER_RANGE, PORT_RANGE, RATE_RANGE, Settings,
+    BOT_COUNT_RANGE, BOT_POOL_RANGE, BOT_SECONDS_RANGE, BOT_SESSION_RANGE, BotContext, BotModel,
+    LEVEL_RANGE, LLM_TEMPERATURE_RANGE, LLM_THINK_RANGE, MOB_DENSITY_RANGE, PACKETVER_RANGE,
+    PORT_RANGE, RATE_RANGE, SHARE_RANGE, SIM_SPEED_RANGE, Settings,
 };
 
 use eframe::egui;
@@ -45,15 +47,17 @@ const BOT_LOGOUT_TIMEOUT: Duration = Duration::from_secs(60);
 enum Page {
     General,
     Server,
+    Bots,
     Components,
     Processes,
     Logs,
 }
 
 impl Page {
-    const ALL: [Page; 5] = [
+    const ALL: [Page; 6] = [
         Page::General,
         Page::Server,
+        Page::Bots,
         Page::Components,
         Page::Processes,
         Page::Logs,
@@ -62,7 +66,8 @@ impl Page {
     fn title(self) -> &'static str {
         match self {
             Page::General => "General",
-            Page::Server => "Server & bots",
+            Page::Server => "Server",
+            Page::Bots => "Bots",
             Page::Components => "Components",
             Page::Processes => "Processes",
             Page::Logs => "Logs",
@@ -125,6 +130,9 @@ pub struct App {
     /// estimate its progress.
     cargo_units: Option<usize>,
     cargo_compiled: usize,
+    /// The model server URL the Bots page checked last, and whether it answered (`None` while
+    /// checking).
+    endpoint_check: Option<(String, Option<bool>)>,
 
     logs: VecDeque<LogLine>,
     log_files: Arc<LogFiles>,
@@ -196,6 +204,7 @@ impl App {
             job_line: String::new(),
             cargo_units: None,
             cargo_compiled: 0,
+            endpoint_check: None,
             logs: VecDeque::new(),
             log_files: LogFiles::new(),
             log_file_error_shown: false,
@@ -306,6 +315,11 @@ impl App {
                     }
                 }
                 AppEvent::ProcLog { name, line } => self.push_log_line(&name, line, LogLevel::Info),
+                AppEvent::EndpointChecked { url, reachable } => {
+                    if matches!(&self.endpoint_check, Some((checked, _)) if *checked == url) {
+                        self.endpoint_check = Some((url, Some(reachable)));
+                    }
+                }
                 AppEvent::ServerReady { generation, result } => {
                     if generation != self.server_gen || self.server_pid.is_none() {
                         continue;
@@ -743,10 +757,14 @@ impl App {
             self.bot_stdin = spawned.stdin;
             self.bots_stopping = false;
             self.bot_started = Some(Instant::now());
+            let model = match settings.bot_model_url() {
+                Some(url) => format!("{} at {url}", settings.bot_model.label()),
+                None => "no model".into(),
+            };
             self.push_log(
                 "bots",
                 format!(
-                    "{} bots joining the game server in {}",
+                    "{} bots joining the game server in {} ({model})",
                     settings.bot_count,
                     settings.server_dir().display()
                 ),
@@ -1147,13 +1165,13 @@ impl App {
                         .on_hover_text("Logins from this computer skip the account system: the client asks only for a name and a sex, and a new name gets an account on first use. Other computers still log in with an account.");
                     ui.end_row();
 
-                    ui.label("Bots");
-                    ui.horizontal(|ui| {
-                        ui.checkbox(&mut self.settings.launch_bots, "start with the server")
-                            .on_hover_text("Starts rust-ro-bot once the server accepts connections. The bots talk and pick some goals with the decision model at 127.0.0.1:9931; without it they play by the rules alone.");
-                        checked_field(ui, "bot_count", &mut self.settings.bot_count, BOT_COUNT_RANGE);
-                        ui.label(RichText::new("playing at once").small().color(MUTED));
-                    });
+                    ui.label("Registration");
+                    ui.checkbox(&mut self.settings.account_registration, "names ending in _M / _F create accounts")
+                        .on_hover_text("login.new_account: also lets a client's Register screen create accounts.");
+                    ui.end_row();
+
+                    ui.label("Server name");
+                    ui.add(egui::TextEdit::singleline(&mut self.settings.server_name).desired_width(180.0));
                     ui.end_row();
 
                     ui.label("Packet version");
@@ -1197,6 +1215,27 @@ impl App {
                         checked_field(ui, "mob_density", &mut self.settings.mob_density, MOB_DENSITY_RANGE);
                     });
                     ui.end_row();
+
+                    ui.label("Simulation speed");
+                    ui.horizontal(|ui| {
+                        checked_field(ui, "sim_speed", &mut self.settings.sim_speed, SIM_SPEED_RANGE);
+                        ui.label(RichText::new("game time per real time, 1 = normal").small().color(MUTED));
+                    })
+                    .response
+                    .on_hover_text("game.sim_speed: 10 runs timers, mobs and skills ten times faster, which helps testing bots. A slow machine cannot keep up beyond its tick budget.");
+                    ui.end_row();
+
+                    ui.label("Max base level");
+                    ui.horizontal(|ui| {
+                        checked_field(ui, "max_base_level", &mut self.settings.max_base_level, LEVEL_RANGE);
+                    });
+                    ui.end_row();
+
+                    ui.label("Max stat level");
+                    ui.horizontal(|ui| {
+                        checked_field(ui, "max_stat_level", &mut self.settings.max_stat_level, LEVEL_RANGE);
+                    });
+                    ui.end_row();
                 });
             ui.label(
                 RichText::new(
@@ -1214,6 +1253,234 @@ impl App {
                 .small()
                 .color(MUTED),
             );
+        });
+    }
+
+    /// Every other option of the server's config.json, as JSON merged over the template.
+    fn server_overrides_ui(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(8.0);
+        ui.label(RichText::new("More server options").strong());
+        ui.group(|ui| {
+            ui.label(
+                RichText::new(
+                    "A JSON object merged into rust-ro/config.json, e.g. {\"game\": {\"pvp_exp\": true}, \"char_server\": {\"start_zeny\": 1000}}. config.template.json lists every option. The fields above win over it.",
+                )
+                .small()
+                .color(MUTED),
+            );
+            ui.add(
+                egui::TextEdit::multiline(&mut self.settings.server_overrides)
+                    .code_editor()
+                    .desired_rows(5)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("{}"),
+            );
+            if let Err(error) = self.settings.server_overrides() {
+                ui.colored_label(BAD, format!("{error}; the configuration is not written"));
+            }
+            if ui.button("Open config.template.json").clicked() {
+                open_path(&self.settings.server_dir().join("config.template.json"));
+            }
+        });
+    }
+
+    fn bots_page(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Bots · rust-ro-bot").strong());
+        ui.group(|ui| {
+            egui::Grid::new("bots")
+                .num_columns(2)
+                .spacing([8.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("Start");
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.settings.launch_bots, "with the server")
+                            .on_hover_text("Starts rust-ro-bot once the server accepts connections. The Bot API must be enabled on the Server page.");
+                        checked_field(ui, "bot_count", &mut self.settings.bot_count, BOT_COUNT_RANGE);
+                        ui.label(RichText::new("playing at once").small().color(MUTED));
+                    });
+                    ui.end_row();
+
+                    ui.label("Model");
+                    egui::ComboBox::from_id_salt("bot_model")
+                        .selected_text(self.settings.bot_model.label())
+                        .show_ui(ui, |ui| {
+                            for model in BotModel::ALL {
+                                ui.selectable_value(&mut self.settings.bot_model, model, model.label());
+                            }
+                        })
+                        .response
+                        .on_hover_text("The decision model talks in sentences from a catalogue and makes a quarter of the goal choices. The LLM talks in its own words and makes every goal choice. Without a model the rules pick the goals and the bots neither chat nor post on the forum.");
+                    ui.end_row();
+
+                    match self.settings.bot_model {
+                        BotModel::DecisionModel => {
+                            ui.label("Decision model server");
+                            self.endpoint_row(ui, "decision_url");
+                            ui.end_row();
+                        }
+                        BotModel::Llm => {
+                            ui.label("LLM server");
+                            self.endpoint_row(ui, "llm_url");
+                            ui.end_row();
+
+                            ui.label("Model name");
+                            ui.add(egui::TextEdit::singleline(&mut self.settings.bot_llm_model).desired_width(180.0))
+                                .on_hover_text("Sent to the llama.cpp server, which serves one model and ignores it.");
+                            ui.end_row();
+
+                            ui.label("Thinking budget");
+                            ui.horizontal(|ui| {
+                                checked_field(ui, "bot_llm_think", &mut self.settings.bot_llm_think, LLM_THINK_RANGE);
+                                ui.label(RichText::new("tokens before an answer, 0 = off").small().color(MUTED));
+                            });
+                            ui.end_row();
+
+                            ui.label("Temperature");
+                            ui.horizontal(|ui| {
+                                checked_field(ui, "bot_llm_temperature", &mut self.settings.bot_llm_temperature, LLM_TEMPERATURE_RANGE);
+                            });
+                            ui.end_row();
+
+                            ui.label("Strategist memory");
+                            egui::ComboBox::from_id_salt("bot_context")
+                                .selected_text(self.settings.bot_context.label())
+                                .show_ui(ui, |ui| {
+                                    for context in [BotContext::SkillState, BotContext::History] {
+                                        ui.selectable_value(&mut self.settings.bot_context, context, context.label());
+                                    }
+                                });
+                            ui.end_row();
+                        }
+                        BotModel::None => {}
+                    }
+
+                    if self.settings.bot_model != BotModel::None {
+                        ui.label("Model share");
+                        ui.horizontal(|ui| {
+                            let default = self.settings.bot_model.default_share();
+                            optional_field(ui, "bot_model_share", &mut self.settings.bot_model_share, default, SHARE_RANGE);
+                            ui.label(
+                                RichText::new(format!("of the goal choices, 0 to 1 (default {default})"))
+                                    .small()
+                                    .color(MUTED),
+                            );
+                        })
+                        .response
+                        .on_hover_text("The other goal choices use the deterministic rules, which cost nothing.");
+                        ui.end_row();
+                    }
+
+                    ui.label("Sessions");
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.settings.bot_sessions, "take turns")
+                            .on_hover_text("A bot logs off after its session and the character of the pool that rested longest takes its place. Unticked, every bot stays in the game.");
+                        ui.add_enabled_ui(self.settings.bot_sessions, |ui| {
+                            checked_field(ui, "bot_session_min", &mut self.settings.bot_session_min, BOT_SESSION_RANGE);
+                            ui.label("to");
+                            checked_field(ui, "bot_session_max", &mut self.settings.bot_session_max, BOT_SESSION_RANGE);
+                            ui.label(RichText::new("minutes").small().color(MUTED));
+                        });
+                    });
+                    ui.end_row();
+
+                    ui.label("Pool");
+                    ui.add_enabled_ui(self.settings.bot_sessions, |ui| {
+                        ui.horizontal(|ui| {
+                            let default = self.settings.bot_count * 2;
+                            optional_field(ui, "bot_pool", &mut self.settings.bot_pool, default, BOT_POOL_RANGE);
+                            ui.label(
+                                RichText::new(format!("characters taking turns (default {default}, twice the bots)"))
+                                    .small()
+                                    .color(MUTED),
+                            );
+                        });
+                    });
+                    ui.end_row();
+
+                    ui.label("Join gap");
+                    ui.horizontal(|ui| {
+                        checked_field(ui, "bot_join_gap", &mut self.settings.bot_join_gap, BOT_SECONDS_RANGE);
+                        ui.label(RichText::new("seconds between two bots joining").small().color(MUTED));
+                    });
+                    ui.end_row();
+
+                    ui.label("Strategist period");
+                    ui.horizontal(|ui| {
+                        checked_field(ui, "bot_strategist_period", &mut self.settings.bot_strategist_period, BOT_SECONDS_RANGE);
+                        ui.label(RichText::new("seconds between goal choices when nothing happens").small().color(MUTED));
+                    });
+                    ui.end_row();
+
+                    ui.label("Play");
+                    ui.horizontal(|ui| {
+                        ui.add_enabled(
+                            self.settings.bot_model != BotModel::None,
+                            egui::Checkbox::new(&mut self.settings.bot_forum, "visit the forum"),
+                        )
+                        .on_hover_text("Bots with a voice read and post on the players' forum.");
+                        ui.checkbox(&mut self.settings.bot_solo, "solo")
+                            .on_hover_text("No parties, not even one found on the party booking board.");
+                    });
+                    ui.end_row();
+
+                    ui.label("Extra arguments");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.bot_extra_args)
+                            .desired_width(360.0)
+                            .hint_text("e.g. --role healer --llm-top-p 0.9"),
+                    )
+                    .on_hover_text("Added to `rust-ro-bot run`, separated by spaces. `rust-ro-bot run --help` lists them.");
+                    ui.end_row();
+                });
+            ui.label(
+                RichText::new("Changes apply the next time the bots start. The Bot API port and the server's bot room are on the Server page.")
+                    .small()
+                    .color(MUTED),
+            );
+        });
+    }
+
+    /// The URL of a model server with a button that checks whether it accepts connections.
+    fn endpoint_row(&mut self, ui: &mut egui::Ui, which: &'static str) {
+        ui.horizontal(|ui| {
+            let url = match which {
+                "llm_url" => &mut self.settings.bot_llm_url,
+                _ => &mut self.settings.bot_decision_url,
+            };
+            ui.add(egui::TextEdit::singleline(url).desired_width(220.0));
+            let url = url.trim().to_string();
+            if ui
+                .button("Check")
+                .on_hover_text("Tries to connect to the server")
+                .clicked()
+            {
+                self.check_endpoint(url.clone());
+            }
+            match &self.endpoint_check {
+                Some((checked, None)) if *checked == url => {
+                    ui.label(RichText::new("checking…").small().color(MUTED));
+                }
+                Some((checked, Some(true))) if *checked == url => {
+                    ui.colored_label(OK, "reachable");
+                }
+                Some((checked, Some(false))) if *checked == url => {
+                    ui.colored_label(BAD, "no answer: the bots play by the rules alone");
+                }
+                _ => {}
+            }
+        });
+    }
+
+    /// Probes a model server's port off the UI thread; `EndpointChecked` brings the answer.
+    fn check_endpoint(&mut self, url: String) {
+        self.endpoint_check = Some((url.clone(), None));
+        let tx = self.tx.clone();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let reachable =
+                url_host_port(&url).is_some_and(|(host, port)| port_accepts(&host, port));
+            let _ = tx.send(AppEvent::EndpointChecked { url, reachable });
+            ctx.request_repaint();
         });
     }
 
@@ -1471,7 +1738,7 @@ impl App {
                 self.enqueue(
                     "Generate configuration",
                     JobKind::GenerateConfigs {
-                        settings: settings.clone(),
+                        settings: Box::new(settings.clone()),
                     },
                 );
             }
@@ -1925,6 +2192,52 @@ fn cargo_lock_packages(dir: &Path) -> Option<usize> {
     )
 }
 
+/// An optional setting: unticked it keeps the bots' default (`default`, shown greyed out), ticked
+/// its number is typed in.
+fn optional_field<T>(
+    ui: &mut egui::Ui,
+    name: &'static str,
+    value: &mut Option<T>,
+    default: T,
+    range: RangeInclusive<f64>,
+) where
+    T: Copy + Display + FromStr + Into<f64> + Send + Sync + 'static,
+{
+    let mut custom = value.is_some();
+    if ui.checkbox(&mut custom, "set").changed() {
+        *value = custom.then_some(default);
+        ui.data_mut(|data| data.remove::<String>(egui::Id::new(name)));
+    }
+    match value {
+        Some(number) => checked_field(ui, name, number, range),
+        None => {
+            ui.add_enabled(
+                false,
+                egui::TextEdit::singleline(&mut default.to_string()).desired_width(120.0),
+            );
+        }
+    }
+}
+
+/// Host and port of an `http://host:port/...` URL (port 80 or 443 when it has none).
+fn url_host_port(url: &str) -> Option<(String, u16)> {
+    let (scheme, rest) = url.trim().split_once("://").unwrap_or(("http", url.trim()));
+    let authority = rest.split('/').next()?;
+    let default = if scheme.eq_ignore_ascii_case("https") {
+        443
+    } else {
+        80
+    };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) if !host.ends_with(']') || authority.starts_with('[') => {
+            (host, port.parse().ok()?)
+        }
+        _ => (authority, default),
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    (!host.is_empty()).then(|| (host.to_string(), port))
+}
+
 /// A process started by [`App::spawn_managed`].
 struct Spawned {
     pid: u32,
@@ -2078,6 +2391,32 @@ mod tests {
         // The pid is never looked at: the exit flag says it is gone.
         wait_or_kill(u32::MAX, &AtomicBool::new(true), Duration::from_secs(30));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn model_server_urls_give_their_host_and_port() {
+        assert_eq!(
+            url_host_port("http://127.0.0.1:9931"),
+            Some(("127.0.0.1".into(), 9931))
+        );
+        assert_eq!(
+            url_host_port(" http://gpu-box:8080/v1 "),
+            Some(("gpu-box".into(), 8080))
+        );
+        assert_eq!(
+            url_host_port("https://models.lan"),
+            Some(("models.lan".into(), 443))
+        );
+        assert_eq!(
+            url_host_port("localhost:8080"),
+            Some(("localhost".into(), 8080))
+        );
+        assert_eq!(
+            url_host_port("http://[::1]:8080"),
+            Some(("::1".into(), 8080))
+        );
+        assert_eq!(url_host_port("http://host:port"), None);
+        assert_eq!(url_host_port(""), None);
     }
 
     #[test]

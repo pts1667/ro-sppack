@@ -49,7 +49,7 @@ pub enum JobKind {
         marker: PathBuf,
     },
     GenerateConfigs {
-        settings: Settings,
+        settings: Box<Settings>,
     },
 }
 
@@ -772,7 +772,7 @@ fn plan(settings: &Settings, rebuild: bool, redo_data: bool) -> Vec<(String, Job
     plan.push((
         "Generate configuration".to_string(),
         JobKind::GenerateConfigs {
-            settings: settings.clone(),
+            settings: Box::new(settings.clone()),
         },
     ));
     plan
