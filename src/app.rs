@@ -1,4 +1,7 @@
-//! egui dashboard: setup checklist, install pipeline and process orchestration.
+//! The launcher window: the home screen with the update bar and PLAY, the settings menu, the
+//! install/update pipeline and process orchestration.
+
+mod home;
 
 use crate::assets;
 use crate::config_gen;
@@ -37,11 +40,57 @@ const PORT_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 /// How long the bots may take to finish their step, save and log out before they are killed.
 const BOT_LOGOUT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Pages of the settings menu.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Tab {
-    Setup,
-    Dashboard,
+enum Page {
+    General,
+    Server,
+    Components,
+    Processes,
     Logs,
+}
+
+impl Page {
+    const ALL: [Page; 5] = [
+        Page::General,
+        Page::Server,
+        Page::Components,
+        Page::Processes,
+        Page::Logs,
+    ];
+
+    fn title(self) -> &'static str {
+        match self {
+            Page::General => "General",
+            Page::Server => "Server & bots",
+            Page::Components => "Components",
+            Page::Processes => "Processes",
+            Page::Logs => "Logs",
+        }
+    }
+}
+
+/// The automatic update: `git pull` in every clone, then a build of every component and whatever
+/// else the install is missing.
+#[derive(Clone, PartialEq, Eq)]
+enum UpdateState {
+    /// Not run yet this session.
+    Idle,
+    Pulling,
+    Building,
+    /// `changed`: a pull brought new commits.
+    Done {
+        changed: bool,
+    },
+    Failed(String),
+    /// "Play without updating" was ticked while the update ran.
+    Skipped,
+}
+
+impl UpdateState {
+    fn running(&self) -> bool {
+        matches!(self, UpdateState::Pulling | UpdateState::Building)
+    }
 }
 
 struct LogLine {
@@ -54,9 +103,28 @@ struct LogLine {
 pub struct App {
     settings: Settings,
     settings_snapshot: String,
+    /// What the menu changes in the generated configuration files; `skip_update` is not part of it.
+    config_snapshot: String,
     install_dir_input: String,
     assets_dir_input: String,
-    tab: Tab,
+    /// The settings menu, when it is open.
+    menu: Option<Page>,
+    background: Option<egui::TextureHandle>,
+
+    update: UpdateState,
+    /// Commits checked out before the update started, to tell whether it changed anything.
+    heads_before: String,
+    /// Commits checked out now, shown under PLAY.
+    heads: String,
+    /// Jobs finished since the queue was last empty, for the overall progress.
+    batch_done: usize,
+    job_started: Option<Instant>,
+    /// The last line the running job printed.
+    job_line: String,
+    /// For a cargo job: the packages in `Cargo.lock` and the `Compiling` lines seen so far, which
+    /// estimate its progress.
+    cargo_units: Option<usize>,
+    cargo_compiled: usize,
 
     logs: VecDeque<LogLine>,
     log_files: Arc<LogFiles>,
@@ -102,6 +170,10 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let settings = Settings::load();
         let settings_snapshot = serde_json::to_string(&settings).unwrap_or_default();
+        let config_snapshot = config_snapshot(&settings);
+        home::apply_style(&cc.egui_ctx);
+        let background = home::load_background(&cc.egui_ctx);
+        let heads = heads_text(&settings);
         let install_dir_input = settings.install_dir.display().to_string();
         let assets_dir_input = settings.assets_dir.display().to_string();
 
@@ -111,9 +183,19 @@ impl App {
         let mut app = Self {
             settings,
             settings_snapshot,
+            config_snapshot,
             install_dir_input,
             assets_dir_input,
-            tab: Tab::Setup,
+            menu: None,
+            background,
+            update: UpdateState::Idle,
+            heads_before: String::new(),
+            heads,
+            batch_done: 0,
+            job_started: None,
+            job_line: String::new(),
+            cargo_units: None,
+            cargo_compiled: 0,
             logs: VecDeque::new(),
             log_files: LogFiles::new(),
             log_file_error_shown: false,
@@ -144,7 +226,8 @@ impl App {
 
         app.push_log(
             "launcher",
-            "Ready. Pick an install folder and your kRO assets folder, then press Install Everything.".into(),
+            "Ready. The install folder and your kRO assets folder are set in Settings → General."
+                .into(),
             LogLevel::Info,
         );
         app
@@ -186,6 +269,7 @@ impl App {
             match event {
                 AppEvent::JobLog { id, line } => {
                     if Some(id) == current_id {
+                        self.note_job_line(&line);
                         self.push_log("job", line, LogLevel::Info);
                     }
                 }
@@ -202,8 +286,10 @@ impl App {
                     self.runner.current = None;
                     self.runner.progress = 0.0;
                     self.runner.progress_note.clear();
+                    self.heads = heads_text(&self.settings);
                     match result {
                         Ok(message) => {
+                            self.batch_done += 1;
                             self.push_log("job", format!("{label}: {message}"), LogLevel::Success)
                         }
                         Err(error) => {
@@ -213,6 +299,9 @@ impl App {
                                 LogLevel::Error,
                             );
                             self.queue.clear();
+                            if self.update.running() {
+                                self.update = UpdateState::Failed(format!("{label}: {error}"));
+                            }
                         }
                     }
                 }
@@ -283,7 +372,11 @@ impl App {
                     LogLevel::Warn,
                 );
             }
-            self.apply_configs();
+            let config = config_snapshot(&self.settings);
+            if config != self.config_snapshot {
+                self.config_snapshot = config;
+                self.apply_configs();
+            }
         }
     }
 
@@ -330,10 +423,120 @@ impl App {
         if self.runner.is_running() {
             return;
         }
+        if self.queue.is_empty() {
+            self.advance_update();
+        }
         if let Some((label, kind)) = self.queue.pop_front() {
             self.push_log("job", format!("starting: {label}"), LogLevel::Info);
+            self.job_started = Some(Instant::now());
+            self.job_line.clear();
+            self.cargo_compiled = 0;
+            self.cargo_units = match &kind {
+                JobKind::CargoBuild { dir, .. } => cargo_lock_packages(dir),
+                JobKind::BuildClientData { server_dir, .. } => cargo_lock_packages(server_dir),
+                _ => None,
+            };
             self.runner.start(label, kind);
+        } else {
+            self.batch_done = 0;
         }
+    }
+
+    /// The running job printed `line`: shown under the progress bar, and for cargo counted
+    /// against the packages it builds.
+    fn note_job_line(&mut self, line: &str) {
+        let line = line.trim();
+        if line.is_empty() {
+            return;
+        }
+        if line.starts_with("Compiling ") {
+            self.cargo_compiled += 1;
+        }
+        self.job_line = line.chars().take(120).collect();
+    }
+
+    /// Progress of the running job, from its own reports or estimated from cargo's output.
+    fn job_fraction(&self) -> f32 {
+        if self.runner.progress > 0.0 {
+            return self.runner.progress;
+        }
+        match self.cargo_units {
+            Some(units) if units > 0 => (self.cargo_compiled as f32 / units as f32).min(0.95),
+            _ => 0.0,
+        }
+    }
+
+    /// Starts the update: pulls first, then [`App::advance_update`] queues the builds.
+    fn start_update(&mut self) {
+        self.heads_before = heads_text(&self.settings);
+        self.update = UpdateState::Pulling;
+        self.batch_done = 0;
+        if self.settings.assets_dir.as_os_str().is_empty() {
+            self.push_log(
+                "setup",
+                "No assets folder selected: the client data will not be built. Choose it in Settings → General."
+                    .into(),
+                LogLevel::Warn,
+            );
+        }
+        self.push_log("launcher", "checking for updates…".into(), LogLevel::Info);
+        self.queue
+            .extend(crate::jobs::update_pull_plan(&self.settings));
+    }
+
+    /// The queue ran empty during an update: after the pulls come the builds, after the builds
+    /// the update is done.
+    fn advance_update(&mut self) {
+        match self.update {
+            UpdateState::Pulling => {
+                self.update = UpdateState::Building;
+                self.queue
+                    .extend(crate::jobs::update_build_plan(&self.settings));
+            }
+            UpdateState::Building => {
+                let changed = heads_text(&self.settings) != self.heads_before;
+                self.update = UpdateState::Done { changed };
+                self.push_log(
+                    "launcher",
+                    if changed {
+                        "update installed".into()
+                    } else {
+                        "everything is up to date".into()
+                    },
+                    LogLevel::Success,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    /// Runs the update once per session, before anything was started, unless "Play without
+    /// updating" is ticked. An install that is not complete is always finished.
+    fn maybe_start_update(&mut self) {
+        if !matches!(self.update, UpdateState::Idle | UpdateState::Skipped)
+            || (self.settings.skip_update && self.setup_complete())
+            || self.runner.is_running()
+            || !self.queue.is_empty()
+            || self.any_process()
+        {
+            return;
+        }
+        self.start_update();
+    }
+
+    /// "Play without updating" was ticked during the update: the rest of it is dropped.
+    fn skip_update_now(&mut self) {
+        if !self.update.running() {
+            return;
+        }
+        self.update = UpdateState::Skipped;
+        self.queue.clear();
+        self.runner.cancel();
+        self.push_log("launcher", "update skipped".into(), LogLevel::Warn);
+    }
+
+    fn any_process(&self) -> bool {
+        self.server_pid.is_some() || self.client_pid.is_some() || self.bot_pid.is_some()
     }
 
     fn enqueue(&mut self, label: impl Into<String>, kind: JobKind) {
@@ -721,10 +924,13 @@ impl App {
         if !self.setup_complete() {
             self.push_log(
                 "launcher",
-                "The package is not fully installed yet — open the Setup tab.".into(),
+                "The package is not fully installed yet — see Settings → Components.".into(),
                 LogLevel::Warn,
             );
-            self.tab = Tab::Setup;
+            self.menu = Some(Page::Components);
+            return;
+        }
+        if self.update.running() {
             return;
         }
 
@@ -748,396 +954,321 @@ impl App {
 
     // -- UI ----------------------------------------------------------------------
 
-    fn top_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.heading("ro-sppack");
-                ui.label(RichText::new("Ragnarok Online · rust-ro + nostalro-client").color(MUTED));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let ready = self.setup_complete();
-                    if ui
-                        .add_enabled(
-                            ready,
-                            egui::Button::new(RichText::new("Launch Game").strong()),
-                        )
-                        .on_hover_text(
-                            "Generate configuration, start the game server and the native client",
-                        )
-                        .clicked()
-                    {
-                        self.launch_game();
-                    }
-                    if ui.button("Stop All").clicked() {
-                        self.stop_all();
-                    }
-                });
-            });
-            ui.add_space(4.0);
-        });
+    /// Component and process states, shown under the menu's pages.
+    fn status_overview(&self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Components").strong());
+        let settings = &self.settings;
+        status_line(
+            ui,
+            "rust-ro server",
+            settings.server_built(),
+            settings.server_cloned(),
+        );
+        status_line(
+            ui,
+            "nostalro client",
+            settings.client_built(),
+            settings.client_cloned(),
+        );
+        status_line(
+            ui,
+            "rust-ro-bot",
+            settings.bot_built(),
+            settings.bot_cloned(),
+        );
+        status_line(
+            ui,
+            "client data",
+            assets::client_data_ready(settings),
+            !settings.assets_dir.as_os_str().is_empty(),
+        );
+        if settings.install_translation {
+            status_line(
+                ui,
+                "translation",
+                settings.translation_applied(),
+                settings.translation_cloned(),
+            );
+        }
+        ui.add_space(10.0);
+        ui.label(RichText::new("Processes").strong());
+        process_line(
+            ui,
+            "server",
+            self.server_pid,
+            self.server_started,
+            self.server_stopping,
+        );
+        process_line(ui, "client", self.client_pid, self.client_started, false);
+        process_line(
+            ui,
+            "bots",
+            self.bot_pid,
+            self.bot_started,
+            self.bots_stopping,
+        );
     }
 
-    fn side_bar(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("nav")
-            .resizable(false)
-            .exact_width(190.0)
-            .show(ctx, |ui| {
-                ui.add_space(8.0);
-                ui.selectable_value(&mut self.tab, Tab::Setup, "Setup");
-                ui.selectable_value(&mut self.tab, Tab::Dashboard, "Dashboard");
-                ui.selectable_value(&mut self.tab, Tab::Logs, "Logs");
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(6.0);
-                ui.label(RichText::new("Components").strong());
-                let settings = self.settings.clone();
-                status_line(
-                    ui,
-                    "rust-ro server",
-                    settings.server_built(),
-                    settings.server_cloned(),
+    fn general_page(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Folders").strong());
+        ui.group(|ui| {
+            let mut browse_install = false;
+            let mut browse_assets = false;
+
+            path_field_row(ui, "Install folder", &mut self.install_dir_input, &mut browse_install);
+            path_field_row(ui, "Assets folder", &mut self.assets_dir_input, &mut browse_assets);
+
+            if browse_install {
+                let start = std::path::PathBuf::from(self.install_dir_input.trim());
+                if let Some(dir) = rfd::FileDialog::new().set_directory(&start).pick_folder() {
+                    self.install_dir_input = dir.display().to_string();
+                }
+            }
+            if browse_assets {
+                let start = std::path::PathBuf::from(self.assets_dir_input.trim());
+                if let Some(dir) = rfd::FileDialog::new().set_directory(&start).pick_folder() {
+                    self.assets_dir_input = dir.display().to_string();
+                }
+            }
+
+            ui.label(
+                RichText::new(
+                    "The assets folder is your client root: the folder that contains DATA.INI and the .grf archives.",
+                )
+                .small()
+                .color(MUTED),
+            );
+            ui.add_space(4.0);
+            let install = self.install_dir_input.trim().to_string();
+            if !install.is_empty() {
+                self.settings.install_dir = std::path::PathBuf::from(install);
+            }
+            let assets = self.assets_dir_input.trim().to_string();
+            self.settings.assets_dir = if assets.is_empty() {
+                std::path::PathBuf::new()
+            } else {
+                std::path::PathBuf::from(assets)
+            };
+        });
+
+        ui.add_space(8.0);
+        ui.label(RichText::new("Client data").strong());
+        ui.group(|ui| {
+            ui.label(
+                RichText::new(
+                    "The server builds the game data from your kRO folder (rust-ro tools/client-data) and serves it on the client data port. The client downloads what it needs from there, so no archives are copied into nostalro-client.",
+                )
+                .small()
+                .color(MUTED),
+            );
+            ui.add_space(4.0);
+            ui.checkbox(
+                &mut self.settings.install_translation,
+                "Install the English translation (ROenglishRE · Pre-Renewal)",
+            );
+            ui.label(
+                RichText::new(
+                    "Cloned during setup and layered over nostalro-client/data/extracted/, which the client reads before the served data: Renewal base, then the Pre-Renewal files, then the 2012-era compatibility tables (item/skill/message text). Enabled by default on English systems.",
+                )
+                .small()
+                .color(MUTED),
+            );
+            ui.add_space(4.0);
+        });
+
+        ui.add_space(8.0);
+        ui.label(RichText::new("Updates & builds").strong());
+        ui.group(|ui| {
+            ui.checkbox(&mut self.settings.skip_update, "Play without updating")
+                .on_hover_text(
+                    "Unticked, the launcher pulls every repository and rebuilds what changed each time it starts. Ticked, it only finishes an install that is not complete.",
                 );
-                status_line(
-                    ui,
-                    "nostalro client",
-                    settings.client_built(),
-                    settings.client_cloned(),
-                );
-                status_line(
-                    ui,
-                    "rust-ro-bot",
-                    settings.bot_built(),
-                    settings.bot_cloned(),
-                );
-                status_line(
-                    ui,
-                    "client data",
-                    assets::client_data_ready(&settings),
-                    !settings.assets_dir.as_os_str().is_empty(),
-                );
-                if settings.install_translation {
-                    status_line(
-                        ui,
-                        "translation",
-                        settings.translation_applied(),
-                        settings.translation_cloned(),
+            ui.horizontal_wrapped(|ui| {
+                ui.checkbox(&mut self.settings.build_release, "Release build");
+                ui.checkbox(&mut self.settings.debug_log, "Server debug log")
+                    .on_hover_text(
+                        "Starts the server with --debug-log: logs failed NPC conversations and other script failures. Applies on the next server start.",
                     );
-                }
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(6.0);
-                ui.label(RichText::new("Processes").strong());
-                process_line(
-                    ui,
-                    "server",
-                    self.server_pid,
-                    self.server_started,
-                    self.server_stopping,
-                );
-                process_line(ui, "client", self.client_pid, self.client_started, false);
-                process_line(
-                    ui,
-                    "bots",
-                    self.bot_pid,
-                    self.bot_started,
-                    self.bots_stopping,
-                );
             });
-    }
-
-    fn central(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| match self.tab {
-            Tab::Setup => self.setup_tab(ui),
-            Tab::Dashboard => self.dashboard_tab(ui),
-            Tab::Logs => self.logs_tab(ui),
         });
     }
 
-    fn setup_tab(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.add_space(4.0);
-            ui.label(RichText::new("Folders").strong());
-            ui.group(|ui| {
-                let mut browse_install = false;
-                let mut browse_assets = false;
+    fn server_page(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Server & network").strong());
+        ui.group(|ui| {
+            egui::Grid::new("network")
+                .num_columns(2)
+                .spacing([8.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("Bind host");
+                    ui.add(egui::TextEdit::singleline(&mut self.settings.server_host).desired_width(180.0));
+                    ui.end_row();
 
-                path_field_row(ui, "Install folder", &mut self.install_dir_input, &mut browse_install);
-                path_field_row(ui, "Assets folder", &mut self.assets_dir_input, &mut browse_assets);
-
-                if browse_install {
-                    let start = std::path::PathBuf::from(self.install_dir_input.trim());
-                    if let Some(dir) = rfd::FileDialog::new().set_directory(&start).pick_folder() {
-                        self.install_dir_input = dir.display().to_string();
-                    }
-                }
-                if browse_assets {
-                    let start = std::path::PathBuf::from(self.assets_dir_input.trim());
-                    if let Some(dir) = rfd::FileDialog::new().set_directory(&start).pick_folder() {
-                        self.assets_dir_input = dir.display().to_string();
-                    }
-                }
-
-                ui.label(
-                    RichText::new(
-                        "The assets folder is your client root: the folder that contains DATA.INI and the .grf archives.",
-                    )
-                    .small()
-                    .color(MUTED),
-                );
-                ui.add_space(4.0);
-                let install = self.install_dir_input.trim().to_string();
-                if !install.is_empty() {
-                    self.settings.install_dir = std::path::PathBuf::from(install);
-                }
-                let assets = self.assets_dir_input.trim().to_string();
-                self.settings.assets_dir = if assets.is_empty() {
-                    std::path::PathBuf::new()
-                } else {
-                    std::path::PathBuf::from(assets)
-                };
-            });
-
-            // Primary actions, right below the folders they operate on.
-            ui.add_space(10.0);
-            let ready = self.setup_complete();
-            let busy = self.runner.is_running();
-            ui.horizontal(|ui| {
-                let size = egui::vec2(160.0, 44.0);
-                let install = ui
-                    .add_enabled_ui(!busy, |ui| {
-                        ui.add_sized(
-                            size,
-                            egui::Button::new(RichText::new("INSTALL").strong().size(18.0)),
-                        )
-                    })
-                    .inner;
-                let install = if busy {
-                    install.on_disabled_hover_text("An install is already running")
-                } else if ready {
-                    install.on_hover_text("Everything is already installed")
-                } else {
-                    install.on_hover_text("Clone, build and prepare whatever is missing")
-                };
-                if install.clicked() {
-                    self.queue_install(false);
-                }
-                let play = ui
-                    .add_enabled_ui(ready, |ui| {
-                        ui.add_sized(
-                            size,
-                            egui::Button::new(RichText::new("PLAY").strong().size(18.0)),
-                        )
-                    })
-                    .inner;
-                let play = if ready {
-                    play.on_hover_text("Start the game server and the native client")
-                } else {
-                    play.on_disabled_hover_text("Install everything first")
-                };
-                if play.clicked() {
-                    self.launch_game();
-                }
-                if !ready {
-                    ui.label(RichText::new("Setup incomplete").small().color(WARN));
-                }
-            });
-
-            ui.add_space(8.0);
-            ui.label(RichText::new("Server & network").strong());
-            ui.group(|ui| {
-                egui::Grid::new("network")
-                    .num_columns(2)
-                    .spacing([8.0, 8.0])
-                    .show(ui, |ui| {
-                        ui.label("Bind host");
-                        ui.add(egui::TextEdit::singleline(&mut self.settings.server_host).desired_width(180.0));
-                        ui.end_row();
-
-                        ui.label("Advertised host");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.settings.public_host)
-                                .desired_width(180.0)
-                                .hint_text("empty = auto (127.0.0.1)"),
-                        );
-                        ui.end_row();
-
-                        ui.label("Game port");
-                        ui.horizontal(|ui| {
-                            checked_field(ui, "game_port", &mut self.settings.game_port, PORT_RANGE);
-                        });
-                        ui.end_row();
-
-                        ui.label("Client data port");
-                        ui.horizontal(|ui| {
-                            checked_field(ui, "client_data_port", &mut self.settings.client_data_port, PORT_RANGE);
-                        })
-                        .response
-                        .on_hover_text("Serves the game data the client downloads (the client's data_url).");
-                        ui.end_row();
-
-                        ui.label("Bot API");
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut self.settings.bot_api_enabled, "enabled")
-                                .on_hover_text("The /bots API lets an external program play characters. Unticked, the server does not open its port.");
-                            checked_field(ui, "bot_api_port", &mut self.settings.bot_api_port, PORT_RANGE);
-                        });
-                        ui.end_row();
-
-                        ui.label("Reference port");
-                        ui.horizontal(|ui| {
-                            checked_field(ui, "reference_port", &mut self.settings.reference_port, PORT_RANGE);
-                        })
-                        .response
-                        .on_hover_text("Serves the game data as JSON (/db) and the wiki (/wiki). The bots plan with it.");
-                        ui.end_row();
-
-                        ui.label("Bots");
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut self.settings.launch_bots, "start with the server")
-                                .on_hover_text("Starts rust-ro-bot once the server accepts connections. The bots talk and pick some goals with the decision model at 127.0.0.1:9931; without it they play by the rules alone.");
-                            checked_field(ui, "bot_count", &mut self.settings.bot_count, BOT_COUNT_RANGE);
-                            ui.label(RichText::new("playing at once").small().color(MUTED));
-                        });
-                        ui.end_row();
-
-                        ui.label("Packet version");
-                        ui.horizontal(|ui| {
-                            checked_field(ui, "packetver", &mut self.settings.packetver, PACKETVER_RANGE);
-                        });
-                        ui.end_row();
-
-                        ui.label("Base EXP rate");
-                        ui.horizontal(|ui| {
-                            checked_field(ui, "base_exp_rate", &mut self.settings.base_exp_rate, RATE_RANGE);
-                        });
-                        ui.end_row();
-
-                        ui.label("Job EXP rate");
-                        ui.horizontal(|ui| {
-                            checked_field(ui, "job_exp_rate", &mut self.settings.job_exp_rate, RATE_RANGE);
-                        });
-                        ui.end_row();
-
-                        ui.label("Drop rate");
-                        ui.horizontal(|ui| {
-                            checked_field(ui, "drop_rate", &mut self.settings.drop_rate, RATE_RANGE);
-                        });
-                        ui.end_row();
-
-                        ui.label("Card drop rate");
-                        ui.horizontal(|ui| {
-                            checked_field(ui, "drop_rate_card", &mut self.settings.drop_rate_card, RATE_RANGE);
-                        });
-                        ui.end_row();
-
-                        ui.label("MVP drop rate");
-                        ui.horizontal(|ui| {
-                            checked_field(ui, "drop_rate_mvp", &mut self.settings.drop_rate_mvp, RATE_RANGE);
-                        });
-                        ui.end_row();
-
-                        ui.label("Mob density");
-                        ui.horizontal(|ui| {
-                            checked_field(ui, "mob_density", &mut self.settings.mob_density, MOB_DENSITY_RANGE);
-                        });
-                        ui.end_row();
-
-                        ui.label("Options");
-                        ui.horizontal_wrapped(|ui| {
-                            ui.checkbox(&mut self.settings.build_release, "Release build");
-                            ui.checkbox(&mut self.settings.debug_log, "Server debug log")
-                                .on_hover_text(
-                                    "Starts the server with --debug-log: logs failed NPC conversations and other script failures. Applies on the next server start.",
-                                );
-                        });
-                        ui.end_row();
-                    });
-                ui.label(
-                    RichText::new(
-                        "Rates are multipliers from 0.0 to 10000.0. Changes are written to the configuration files at once; a running server applies them after a restart.",
-                    )
-                    .small()
-                    .color(MUTED),
-                );
-                ui.label(
-                    RichText::new("In-game login: admin / qwertz (account 2000000).")
-                        .small()
-                        .color(MUTED),
-                );
-            });
-
-            ui.add_space(8.0);
-            ui.label(RichText::new("Client data").strong());
-            ui.group(|ui| {
-                ui.label(
-                    RichText::new(
-                        "The server builds the game data from your kRO folder (rust-ro tools/client-data) and serves it on the client data port. The client downloads what it needs from there, so no archives are copied into nostalro-client.",
-                    )
-                    .small()
-                    .color(MUTED),
-                );
-                ui.add_space(4.0);
-                ui.checkbox(
-                    &mut self.settings.install_translation,
-                    "Install the English translation (ROenglishRE · Pre-Renewal)",
-                );
-                ui.label(
-                    RichText::new(
-                        "Cloned during setup and layered over nostalro-client/data/extracted/, which the client reads before the served data: Renewal base, then the Pre-Renewal files, then the 2012-era compatibility tables (item/skill/message text). Enabled by default on English systems.",
-                    )
-                    .small()
-                    .color(MUTED),
-                );
-                ui.add_space(4.0);
-            });
-
-            ui.add_space(8.0);
-            ui.label(RichText::new("Components").strong());
-            ui.group(|ui| {
-                self.components_ui(ui);
-            });
-
-            ui.add_space(8.0);
-            ui.label(RichText::new("Progress").strong());
-            ui.group(|ui| {
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(!self.runner.is_running(), egui::Button::new("Rebuild Everything"))
-                        .clicked()
-                    {
-                        self.queue_install(true);
-                    }
-                    if ui.button("Clear queue").clicked() {
-                        self.queue.clear();
-                    }
-                });
-
-                let current_label = self.runner.current.as_ref().map(|job| job.label.clone());
-                if let Some(label) = current_label {
-                    ui.add_space(4.0);
-                    ui.label(format!("Running: {label}"));
+                    ui.label("Advertised host");
                     ui.add(
-                        egui::ProgressBar::new(self.runner.progress)
-                            .show_percentage()
-                            .animate(true),
+                        egui::TextEdit::singleline(&mut self.settings.public_host)
+                            .desired_width(180.0)
+                            .hint_text("empty = auto (127.0.0.1)"),
                     );
-                    if !self.runner.progress_note.is_empty() {
-                        ui.label(RichText::new(&self.runner.progress_note).small().color(MUTED));
-                    }
-                    if ui.button("Cancel current job").clicked() {
-                        self.runner.cancel();
-                    }
-                } else if self.queue.is_empty() {
-                    ui.label(RichText::new("Nothing queued.").small().color(MUTED));
+                    ui.end_row();
+
+                    ui.label("Game port");
+                    ui.horizontal(|ui| {
+                        checked_field(ui, "game_port", &mut self.settings.game_port, PORT_RANGE);
+                    });
+                    ui.end_row();
+
+                    ui.label("Client data port");
+                    ui.horizontal(|ui| {
+                        checked_field(ui, "client_data_port", &mut self.settings.client_data_port, PORT_RANGE);
+                    })
+                    .response
+                    .on_hover_text("Serves the game data the client downloads (the client's data_url).");
+                    ui.end_row();
+
+                    ui.label("Bot API");
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.settings.bot_api_enabled, "enabled")
+                            .on_hover_text("The /bots API lets an external program play characters. Unticked, the server does not open its port.");
+                        checked_field(ui, "bot_api_port", &mut self.settings.bot_api_port, PORT_RANGE);
+                    });
+                    ui.end_row();
+
+                    ui.label("Reference port");
+                    ui.horizontal(|ui| {
+                        checked_field(ui, "reference_port", &mut self.settings.reference_port, PORT_RANGE);
+                    })
+                    .response
+                    .on_hover_text("Serves the game data as JSON (/db) and the wiki (/wiki). The bots plan with it.");
+                    ui.end_row();
+
+                    ui.label("Login");
+                    ui.checkbox(&mut self.settings.ip_login, "by IP: no password from this computer")
+                        .on_hover_text("Logins from this computer skip the account system: the client asks only for a name and a sex, and a new name gets an account on first use. Other computers still log in with an account.");
+                    ui.end_row();
+
+                    ui.label("Bots");
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.settings.launch_bots, "start with the server")
+                            .on_hover_text("Starts rust-ro-bot once the server accepts connections. The bots talk and pick some goals with the decision model at 127.0.0.1:9931; without it they play by the rules alone.");
+                        checked_field(ui, "bot_count", &mut self.settings.bot_count, BOT_COUNT_RANGE);
+                        ui.label(RichText::new("playing at once").small().color(MUTED));
+                    });
+                    ui.end_row();
+
+                    ui.label("Packet version");
+                    ui.horizontal(|ui| {
+                        checked_field(ui, "packetver", &mut self.settings.packetver, PACKETVER_RANGE);
+                    });
+                    ui.end_row();
+
+                    ui.label("Base EXP rate");
+                    ui.horizontal(|ui| {
+                        checked_field(ui, "base_exp_rate", &mut self.settings.base_exp_rate, RATE_RANGE);
+                    });
+                    ui.end_row();
+
+                    ui.label("Job EXP rate");
+                    ui.horizontal(|ui| {
+                        checked_field(ui, "job_exp_rate", &mut self.settings.job_exp_rate, RATE_RANGE);
+                    });
+                    ui.end_row();
+
+                    ui.label("Drop rate");
+                    ui.horizontal(|ui| {
+                        checked_field(ui, "drop_rate", &mut self.settings.drop_rate, RATE_RANGE);
+                    });
+                    ui.end_row();
+
+                    ui.label("Card drop rate");
+                    ui.horizontal(|ui| {
+                        checked_field(ui, "drop_rate_card", &mut self.settings.drop_rate_card, RATE_RANGE);
+                    });
+                    ui.end_row();
+
+                    ui.label("MVP drop rate");
+                    ui.horizontal(|ui| {
+                        checked_field(ui, "drop_rate_mvp", &mut self.settings.drop_rate_mvp, RATE_RANGE);
+                    });
+                    ui.end_row();
+
+                    ui.label("Mob density");
+                    ui.horizontal(|ui| {
+                        checked_field(ui, "mob_density", &mut self.settings.mob_density, MOB_DENSITY_RANGE);
+                    });
+                    ui.end_row();
+                });
+            ui.label(
+                RichText::new(
+                    "Rates are multipliers from 0.0 to 10000.0. Changes are written to the configuration files at once; a running server applies them after a restart.",
+                )
+                .small()
+                .color(MUTED),
+            );
+            ui.label(
+                RichText::new(if self.settings.ip_login {
+                    "In-game login: any name, no password. From other computers: admin / qwertz (account 2000000)."
                 } else {
-                    ui.label(format!("{} job(s) queued.", self.queue.len()));
+                    "In-game login: admin / qwertz (account 2000000)."
+                })
+                .small()
+                .color(MUTED),
+            );
+        });
+    }
+
+    fn components_page(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Components").strong());
+        ui.group(|ui| {
+            self.components_ui(ui);
+        });
+
+        ui.add_space(8.0);
+        ui.label(RichText::new("Progress").strong());
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        !self.runner.is_running(),
+                        egui::Button::new("Rebuild Everything"),
+                    )
+                    .clicked()
+                {
+                    self.queue_install(true);
                 }
-                for (label, _) in self.queue.iter().take(15) {
-                    ui.label(RichText::new(format!("• {label}")).small().color(MUTED));
+                if ui.button("Clear queue").clicked() {
+                    self.queue.clear();
                 }
             });
 
-            ui.add_space(12.0);
+            let current_label = self.runner.current.as_ref().map(|job| job.label.clone());
+            if let Some(label) = current_label {
+                ui.add_space(4.0);
+                ui.label(format!("Running: {label}"));
+                ui.add(
+                    egui::ProgressBar::new(self.job_fraction())
+                        .show_percentage()
+                        .animate(true),
+                );
+                let note = if self.runner.progress_note.is_empty() {
+                    &self.job_line
+                } else {
+                    &self.runner.progress_note
+                };
+                if !note.is_empty() {
+                    ui.label(RichText::new(note).small().color(MUTED));
+                }
+                if ui.button("Cancel current job").clicked() {
+                    self.runner.cancel();
+                }
+            } else if self.queue.is_empty() {
+                ui.label(RichText::new("Nothing queued.").small().color(MUTED));
+            } else {
+                ui.label(format!("{} job(s) queued.", self.queue.len()));
+            }
+            for (label, _) in self.queue.iter().take(15) {
+                ui.label(RichText::new(format!("• {label}")).small().color(MUTED));
+            }
         });
     }
 
@@ -1201,6 +1332,7 @@ impl App {
                         "Update rust-ro server",
                         JobKind::GitPull {
                             dir: settings.server_dir(),
+                            stale_marker: None,
                         },
                     );
                 }
@@ -1241,6 +1373,7 @@ impl App {
                         "Update nostalro client",
                         JobKind::GitPull {
                             dir: settings.client_dir(),
+                            stale_marker: None,
                         },
                     );
                 }
@@ -1281,6 +1414,7 @@ impl App {
                         "Update rust-ro-bot",
                         JobKind::GitPull {
                             dir: settings.bot_dir(),
+                            stale_marker: None,
                         },
                     );
                 }
@@ -1378,6 +1512,7 @@ impl App {
                             "Update ROenglishRE",
                             JobKind::GitPull {
                                 dir: settings.translation_dir(),
+                                stale_marker: Some(settings.translation_marker()),
                             },
                         );
                     }
@@ -1387,13 +1522,12 @@ impl App {
     }
 
     fn dashboard_tab(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
         ui.label(RichText::new("Processes").strong());
         let settings = self.settings.clone();
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.group(|ui| {
-                ui.set_min_width(300.0);
+                ui.set_min_width(250.0);
                 ui.label(RichText::new("Game server").strong());
                 process_card_status(
                     ui,
@@ -1424,7 +1558,7 @@ impl App {
             });
 
             ui.group(|ui| {
-                ui.set_min_width(300.0);
+                ui.set_min_width(250.0);
                 ui.label(RichText::new("Game client").strong());
                 process_card_status(ui, self.client_pid, self.client_started, None);
                 ui.label(
@@ -1451,7 +1585,7 @@ impl App {
             });
 
             ui.group(|ui| {
-                ui.set_min_width(300.0);
+                ui.set_min_width(250.0);
                 ui.label(RichText::new("Bots").strong());
                 process_card_status(
                     ui,
@@ -1491,15 +1625,11 @@ impl App {
 
         ui.add_space(10.0);
         ui.horizontal(|ui| {
-            let ready = self.setup_complete();
             if ui
-                .add_enabled(
-                    ready,
-                    egui::Button::new(RichText::new("Launch Game").strong()),
-                )
+                .add_enabled(self.any_process(), egui::Button::new("Stop All"))
                 .clicked()
             {
-                self.launch_game();
+                self.stop_all();
             }
             if ui.button("Open install folder").clicked() {
                 open_path(&settings.install_dir);
@@ -1512,7 +1642,11 @@ impl App {
         ui.add_space(10.0);
         ui.group(|ui| {
             ui.label(RichText::new("Quick facts").strong());
-            ui.label("In-game account: admin / qwertz (id 2000000)");
+            ui.label(if settings.ip_login {
+                "In-game login: any name, no password (from this computer)"
+            } else {
+                "In-game account: admin / qwertz (id 2000000)"
+            });
             ui.label(format!(
                 "Client config: {}",
                 settings.client_config_json().display()
@@ -1526,13 +1660,12 @@ impl App {
             ui.add_space(8.0);
             ui.colored_label(
                 WARN,
-                "Client data is not built yet. Open Setup, choose your kRO folder and press Build client data.",
+                "Client data is not built yet. Choose your kRO folder in General, then press Build client data in Components.",
             );
         }
     }
 
     fn logs_tab(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.label("Filter");
             ui.add(egui::TextEdit::singleline(&mut self.log_filter).desired_width(320.0));
@@ -1578,10 +1711,9 @@ impl eframe::App for App {
         self.handle_events();
         self.stoppers.retain(|stopper| !stopper.is_finished());
         self.maybe_save_settings();
+        self.maybe_start_update();
         self.drain_queue();
-        self.top_bar(ctx);
-        self.side_bar(ctx);
-        self.central(ctx);
+        self.window(ctx);
         ctx.request_repaint_after(Duration::from_millis(300));
     }
 }
@@ -1760,6 +1892,37 @@ fn path_field_row(ui: &mut egui::Ui, label: &str, value: &mut String, browse: &m
             *browse = true;
         }
     });
+}
+
+/// The settings as they reach the generated configuration files: "Play without updating" changes
+/// nothing there.
+fn config_snapshot(settings: &Settings) -> String {
+    let mut settings = settings.clone();
+    settings.skip_update = false;
+    serde_json::to_string(&settings).unwrap_or_default()
+}
+
+/// The commits the server, client and bots have checked out, e.g. `server 1a2b3c4 · client …`.
+fn heads_text(settings: &Settings) -> String {
+    [
+        ("server", settings.server_dir()),
+        ("client", settings.client_dir()),
+        ("bots", settings.bot_dir()),
+    ]
+    .into_iter()
+    .filter_map(|(name, dir)| Some(format!("{name} {}", crate::jobs::git_head(&dir)?)))
+    .collect::<Vec<_>>()
+    .join(" · ")
+}
+
+/// Packages in a workspace's `Cargo.lock`: about what a build from scratch compiles.
+fn cargo_lock_packages(dir: &Path) -> Option<usize> {
+    let lock = std::fs::read_to_string(dir.join("Cargo.lock")).ok()?;
+    Some(
+        lock.lines()
+            .filter(|line| line.trim() == "[[package]]")
+            .count(),
+    )
 }
 
 /// A process started by [`App::spawn_managed`].

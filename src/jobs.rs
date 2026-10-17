@@ -28,6 +28,8 @@ pub enum JobKind {
     },
     GitPull {
         dir: PathBuf,
+        /// Removed when the pull brought new commits, so whatever it marks is prepared again.
+        stale_marker: Option<PathBuf>,
     },
     CargoBuild {
         dir: PathBuf,
@@ -305,17 +307,32 @@ fn run_job(
             Ok(format!("repointed {} at {url}", dest.display()))
         }
 
-        JobKind::GitPull { dir } => run_program(
-            job.id,
-            "git",
-            &["pull".into(), "--ff-only".into()],
-            dir,
-            &[],
-            tx,
-            ctx,
-            cancel,
-            pid_slot,
-        ),
+        JobKind::GitPull { dir, stale_marker } => {
+            let before = git_head(dir);
+            run_program(
+                job.id,
+                "git",
+                &["pull".into(), "--ff-only".into()],
+                dir,
+                &[],
+                tx,
+                ctx,
+                cancel,
+                pid_slot,
+            )?;
+            let after = git_head(dir);
+            if before == after {
+                return Ok("already up to date".into());
+            }
+            if let Some(marker) = stale_marker {
+                let _ = std::fs::remove_file(marker);
+            }
+            Ok(format!(
+                "updated {} → {}",
+                before.as_deref().unwrap_or("?"),
+                after.as_deref().unwrap_or("?")
+            ))
+        }
 
         JobKind::CargoBuild {
             dir,
@@ -597,7 +614,55 @@ fn pinned_toolchain(
 
 /// Compute the sequential setup plan. `force` rebuilds even when an artifact
 /// already exists; otherwise only missing pieces are queued.
+/// Everything a full install still needs. With `force`, every build runs again and the client
+/// data and the translation are prepared again.
 pub fn install_plan(settings: &Settings, force: bool) -> Vec<(String, JobKind)> {
+    plan(settings, force, force)
+}
+
+/// The first half of an update: `git pull` in every clone. A translation that brought new
+/// commits loses its marker, so [`update_build_plan`] applies it again.
+pub fn update_pull_plan(settings: &Settings) -> Vec<(String, JobKind)> {
+    let mut plan = Vec::new();
+    let mut pull = |label: &str, cloned: bool, dir: PathBuf, stale_marker: Option<PathBuf>| {
+        if cloned {
+            plan.push((label.to_string(), JobKind::GitPull { dir, stale_marker }));
+        }
+    };
+    pull(
+        "Update rust-ro server",
+        settings.server_cloned(),
+        settings.server_dir(),
+        None,
+    );
+    pull(
+        "Update nostalro client",
+        settings.client_cloned(),
+        settings.client_dir(),
+        None,
+    );
+    pull(
+        "Update rust-ro-bot",
+        settings.bot_cloned(),
+        settings.bot_dir(),
+        None,
+    );
+    pull(
+        "Update English translation",
+        settings.install_translation && settings.translation_cloned(),
+        settings.translation_dir(),
+        Some(settings.translation_marker()),
+    );
+    plan
+}
+
+/// The second half of an update: cargo builds every component (it only recompiles what changed)
+/// and whatever else is missing is installed.
+pub fn update_build_plan(settings: &Settings) -> Vec<(String, JobKind)> {
+    plan(settings, true, false)
+}
+
+fn plan(settings: &Settings, rebuild: bool, redo_data: bool) -> Vec<(String, JobKind)> {
     let mut plan: Vec<(String, JobKind)> = Vec::new();
 
     let mut have_server = settings.server_cloned();
@@ -646,7 +711,7 @@ pub fn install_plan(settings: &Settings, force: bool) -> Vec<(String, JobKind)> 
         have_translation = true;
     }
 
-    if have_server && (force || !settings.server_built()) {
+    if have_server && (rebuild || !settings.server_built()) {
         plan.push((
             "Build rust-ro server".to_string(),
             JobKind::CargoBuild {
@@ -656,7 +721,7 @@ pub fn install_plan(settings: &Settings, force: bool) -> Vec<(String, JobKind)> 
             },
         ));
     }
-    if have_client && (force || !settings.client_built()) {
+    if have_client && (rebuild || !settings.client_built()) {
         plan.push((
             "Build nostalro client".to_string(),
             JobKind::CargoBuild {
@@ -666,7 +731,7 @@ pub fn install_plan(settings: &Settings, force: bool) -> Vec<(String, JobKind)> 
             },
         ));
     }
-    if have_bot && (force || !settings.bot_built()) {
+    if have_bot && (rebuild || !settings.bot_built()) {
         plan.push((
             "Build rust-ro-bot".to_string(),
             JobKind::CargoBuild {
@@ -678,7 +743,7 @@ pub fn install_plan(settings: &Settings, force: bool) -> Vec<(String, JobKind)> 
     }
     if have_server
         && !settings.assets_dir.as_os_str().is_empty()
-        && (force || !assets::client_data_ready(settings))
+        && (redo_data || !assets::client_data_ready(settings))
     {
         plan.push((
             "Build client data (from the kRO assets)".to_string(),
@@ -693,7 +758,7 @@ pub fn install_plan(settings: &Settings, force: bool) -> Vec<(String, JobKind)> 
     // order matters, so it is one job.
     if settings.install_translation
         && have_translation
-        && (force || !settings.translation_applied())
+        && (redo_data || !settings.translation_applied())
     {
         plan.push((
             "Apply English translation (ROenglishRE, Pre-Renewal)".to_string(),
@@ -711,6 +776,31 @@ pub fn install_plan(settings: &Settings, force: bool) -> Vec<(String, JobKind)> 
         },
     ));
     plan
+}
+
+/// The abbreviated commit a clone has checked out, read from `.git` without running git.
+pub fn git_head(dir: &Path) -> Option<String> {
+    let git = dir.join(".git");
+    let head = std::fs::read_to_string(git.join("HEAD")).ok()?;
+    let head = head.trim();
+    let hash = match head.strip_prefix("ref:") {
+        Some(name) => {
+            let name = name.trim();
+            match std::fs::read_to_string(git.join(name)) {
+                Ok(hash) => hash.trim().to_string(),
+                Err(_) => std::fs::read_to_string(git.join("packed-refs"))
+                    .ok()?
+                    .lines()
+                    .find_map(|line| {
+                        let (hash, line_name) = line.split_once(' ')?;
+                        (line_name.trim() == name).then(|| hash.to_string())
+                    })?,
+            }
+        }
+        None => head.to_string(),
+    };
+    let short: String = hash.chars().take(7).collect();
+    (short.len() == 7 && short.chars().all(|c| c.is_ascii_hexdigit())).then_some(short)
 }
 
 /// Kill a process and its children. Used for both jobs and managed processes.
@@ -878,6 +968,107 @@ mod tests {
         std::fs::write(tree.join("check.jsonl"), "").unwrap();
         assert!(builds(&settings).is_empty());
 
+        std::fs::remove_dir_all(&install).ok();
+    }
+
+    #[test]
+    fn git_head_reads_loose_and_packed_refs() {
+        let dir = std::env::temp_dir().join(format!("ro-sppack-head-{}", std::process::id()));
+        let git = dir.join(".git");
+        std::fs::create_dir_all(git.join("refs/heads")).unwrap();
+        std::fs::write(
+            git.join("HEAD"),
+            "ref: refs/heads/main
+",
+        )
+        .unwrap();
+        std::fs::write(
+            git.join("packed-refs"),
+            "# pack-refs with: peeled
+0123456789abcdef0123456789abcdef01234567 refs/heads/main
+",
+        )
+        .unwrap();
+        assert_eq!(git_head(&dir).as_deref(), Some("0123456"));
+
+        std::fs::write(
+            git.join("refs/heads/main"),
+            "fedcba9876543210fedcba9876543210fedcba98
+",
+        )
+        .unwrap();
+        assert_eq!(git_head(&dir).as_deref(), Some("fedcba9"));
+
+        std::fs::write(
+            git.join("HEAD"),
+            "abcdef0123456789abcdef0123456789abcdef01
+",
+        )
+        .unwrap();
+        assert_eq!(git_head(&dir).as_deref(), Some("abcdef0"));
+        assert_eq!(git_head(&dir.join("missing")), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_update_pulls_every_clone_and_rebuilds_every_component() {
+        let install = std::env::temp_dir().join(format!("ro-sppack-update-{}", std::process::id()));
+        let settings = Settings {
+            install_dir: install.clone(),
+            install_translation: true,
+            ..Settings::default()
+        };
+        for dir in [
+            settings.server_dir(),
+            settings.client_dir(),
+            settings.bot_dir(),
+            settings.translation_dir(),
+        ] {
+            std::fs::create_dir_all(dir.join(".git")).unwrap();
+            std::fs::write(dir.join("Cargo.toml"), "").unwrap();
+        }
+        for source in settings.translation_sources() {
+            std::fs::create_dir_all(source.join("data")).unwrap();
+        }
+        for bin in [
+            settings.server_bin(),
+            settings.client_bin(),
+            settings.bot_bin(),
+        ] {
+            std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+            std::fs::write(bin, "").unwrap();
+        }
+
+        let pulls = update_pull_plan(&settings);
+        assert_eq!(pulls.len(), 4);
+        assert!(
+            pulls
+                .iter()
+                .all(|(_, kind)| matches!(kind, JobKind::GitPull { .. }))
+        );
+        assert!(matches!(
+            &pulls[3].1,
+            JobKind::GitPull { stale_marker: Some(marker), .. } if *marker == settings.translation_marker()
+        ));
+
+        let builds: Vec<String> = update_build_plan(&settings)
+            .into_iter()
+            .filter(|(_, kind)| matches!(kind, JobKind::CargoBuild { .. }))
+            .map(|(label, _)| label)
+            .collect();
+        assert_eq!(
+            builds,
+            [
+                "Build rust-ro server",
+                "Build nostalro client",
+                "Build rust-ro-bot"
+            ]
+        );
+        assert!(
+            !install_plan(&settings, false)
+                .iter()
+                .any(|(_, kind)| matches!(kind, JobKind::CargoBuild { .. }))
+        );
         std::fs::remove_dir_all(&install).ok();
     }
 

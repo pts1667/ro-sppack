@@ -13,8 +13,9 @@ single folder and runs everything from one window:
 | English translation (optional) | [`llchrisll/ROenglishRE`](https://github.com/llchrisll/ROenglishRE) | Loose data files (renewal base, pre-renewal overlay, old-client compatibility tables) that override the archive contents |
 
 ro-sppack is the launcher itself (a small [egui](https://github.com/emilk/egui)
-desktop app). It clones the repositories, builds them, builds the client data,
-writes all configuration, and starts/stops the server and client.
+desktop app). It clones the repositories, keeps them up to date, builds them,
+builds the client data, writes all configuration, and starts/stops the server,
+the client and the bots.
 
 ## Requirements
 
@@ -33,14 +34,14 @@ writes all configuration, and starts/stops the server and client.
 
 1. Download/copy the `ro-sppack` executable to a folder of your choice
    (`cargo build --release` produces `target/release/ro-sppack`).
-2. Run it. The **Setup** tab opens:
+2. Run it. The launcher opens with an update bar and a big button. Open
+   **Settings → General** and:
    - choose an **Install folder** (created if missing),
    - choose your **Assets folder** (the client root with `DATA.INI` + GRFs),
-   - adjust rates/ports if you like,
-   - press **Install Everything**.
+   - adjust rates/ports under **Server & bots** if you like.
 
-   The pipeline runs sequentially and streams every command's output into the
-   **Logs** tab:
+   Then close the menu and press **INSTALL**. The update bar shows each step
+   ("Step 4 of 10 · Compiling …"), and every command's output goes to **Logs**:
    ```
    Clone rust-ro server
    Clone nostalro client
@@ -53,16 +54,44 @@ writes all configuration, and starts/stops the server and client.
    Apply English translation (ROenglishRE, Pre-Renewal)
    Generate configuration
    ```
-3. When **PLAY** lights up, press it. The launcher:
+3. When the button reads **PLAY**, press it. The launcher:
    - regenerates the server configuration and patches the client `config.json`,
    - starts `rust-ro` (game server, default port `6901`),
    - starts the native client, which connects to the login server,
    - starts 50 bots once the server accepts connections (see [Bots](#bots)).
 
-Log in with the seeded account **`admin` / `qwertz`** (account id `2000000`).
-That account is handled entirely by rust-ro; other accounts would be proxied
-to a separate rAthena/Hercules installation and are not available in this
-standalone package.
+The client asks only for a name (and a sex): logins from this computer skip
+the account system (see [Login](#login)).
+
+## Updates
+
+Every time the launcher starts, it updates in the background before anything
+runs: `git pull` in every clone, then `cargo build` of the server, the client
+and the bots (cargo only recompiles what changed), then whatever the install is
+still missing. A translation that pulled new commits is applied again. While it
+runs the button reads **UPDATING…**; afterwards the bar says whether anything
+changed, and the commits in use are shown under the button.
+
+- Tick **Play without updating** above the button to skip it: ticking it
+  during an update cancels the rest, and the launcher does not update on later
+  starts until it is unticked again (unticking updates at once). An install
+  that is not complete is always finished.
+- A failed update is shown in red above the bar. PLAY then starts the version
+  that is installed, and **INSTALL** (when something is missing) tries again.
+- **Settings → Components** still has a Build and an Update (git pull) button
+  per component, Install Everything and Rebuild Everything.
+
+## Login
+
+With **Login: by IP** ticked in **Settings → Server & bots** (the default),
+the server config lists this computer in `login.skip_account_ips`: `127.0.0.1`,
+and for LAN play the advertised host when it is an IPv4 address. Logins from
+those addresses need no password; the client asks the server
+(`CA_SERVER_INFO`) and shows only a name and a sex choice, and a name that is
+new gets an account on first use. Other computers still log in with an account,
+such as the seeded **`admin` / `qwertz`** (account id `2000000`). That account
+is handled entirely by rust-ro; other accounts would be proxied to a separate
+rAthena/Hercules installation and are not available in this standalone package.
 
 ## Bots
 
@@ -87,7 +116,7 @@ rules alone and don't chat.
 - The server config gets `bots.max_bots` and `bots.max_registered_bots` of at
   least twice the bot count: the characters take turns with a pool of twice the
   bots, and every one of them must be registered.
-- The **Bots** card in the Dashboard and the **Run** button in Setup start and
+- The **Bots** card in Settings → Processes and the **Run** button in Components start and
   stop them by hand while the server runs.
 - Their output goes to the Logs tab and `logs/bots.log`.
 
@@ -138,6 +167,7 @@ ro-sppack.exe --setup > setup.log 2>&1
 - `server.enable_websocket = true`, `server.enable_legacy_proxy = false`,
 - `server.packetver` (default `20120307`),
 - the seeded account `2000000` appended to `server.accounts`,
+- `login.skip_account_ips` (see [Login](#login)),
 - `game.*` rates (base/job EXP, drop, card drop, MVP drop, mob density),
 - `client_data` (the `/data` endpoint: port 6903 by default, bound to the bind host),
 - `bots` (the bot API: enabled flag and port 6902 by default; with the API
@@ -161,7 +191,7 @@ volumes, graphic options):
   your kRO folder (the archives listed in `DATA.INI`, or every `.grf`). It
   writes `rust-ro/config/client-data`, which the server publishes on the client
   data port. Build it once; *Rebuild Everything* builds it again.
-- **Menu changes.** Every value in the Setup tab is checked before it is used:
+- **Menu changes.** Every value in the Settings menu is checked before it is used:
   rates accept 0.0 to 10000.0, mob density 0.0 to 10.0, and ports 1 to 65535
   (the game, client data, reference and bot ports must differ). A value that is not valid
   is not applied. Valid values are written to both configuration files at once;
@@ -181,17 +211,14 @@ volumes, graphic options):
   This mirrors what the project's `Tools/ClientGenerator.bat` produces for
   *Pre-Renewal* and is what the native client expects; most content is Lua
   table (`.lub`) and item/skill/message `.txt` files, so no archive repacking
-  is needed. Turn it off with *Install the English translation* in Setup, or
+  is needed. Turn it off with *Install the English translation* in Settings → General, or
   re-apply after an update with **Apply into data**.
 - **LAN play.** Set *Bind host* to `0.0.0.0` and *Advertised host* to your
   machine's LAN IP, then open the game port in your firewall. Every player
   needs their own copy of the client configured with your IP as the login
   server. The client does not provide TLS; for internet play use a
   VPN/tunnel.
-- **Updating.** The *Update (git pull)* buttons fetch the latest upstream code;
-  rebuild afterwards with the per-component **Build** buttons or
-  **Rebuild Everything**.
-- **Rebuilds.** `Install Everything` only fills in missing pieces.
+- **Rebuilds.** *Install Everything* (Settings → Components) only fills in missing pieces.
   *Rebuild Everything* forces every build and rebuilds the client data.
 - **Settings file.** Install and assets paths (plus every other option) are
   remembered in `ro-sppack.json` in the current working directory, rewritten
@@ -199,12 +226,12 @@ volumes, graphic options):
   next to the executable by older builds is copied over automatically on first
   run.
 - **Ports in use.** Startup errors from rust-ro or the client appear in the
-  Logs tab; change the game port in Setup and relaunch.
+  Logs; change the game port in Settings → Server & bots and relaunch.
 - **Log files.** Everything in the Logs tab is also written to
   `<install dir>/logs`: `server.log`, `client.log` and `launcher.log` (setup
   jobs and launcher messages). Lines are flushed to disk about every 10
   seconds, and the previous run's file is kept as `<name>.previous.log`.
-- **Server debug log.** Tick **Server debug log** in the Setup options to start
+- **Server debug log.** Tick **Server debug log** in Settings → General to start
   rust-ro with `--debug-log`, which also logs failed NPC conversations and
   other script failures into `server.log`. It applies the next time the server
   starts.

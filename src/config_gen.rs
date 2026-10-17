@@ -84,6 +84,9 @@ fn generate_server_config(settings: &Settings) -> Result<(), String> {
         config["game"]["mob_density"] = json!(settings.mob_density);
     }
 
+    // Logins from this computer need no account: the client asks only for a name.
+    config["login"]["skip_account_ips"] = json!(settings.ip_login_addresses());
+
     // The server publishes the client data it extracted from the kRO archives. It listens on the
     // same bind host as the game, and the client is pointed at it through `data_url`.
     config["client_data"]["enabled"] = json!(true);
@@ -184,6 +187,7 @@ mod tests {
             "drop_rate_mvp": 1.0,
             "mob_density": 1.0
         },
+        "login": { "new_account": true, "skip_account_ips": [] },
         "bots": { "enabled": false, "host": "127.0.0.1", "port": 6902, "max_bots": 20, "max_registered_bots": 200 },
         "reference": { "enabled": true, "host": "127.0.0.1", "port": 6904, "wiki_root": "wiki" },
         "client_data": { "enabled": false, "host": "127.0.0.1", "port": 6903, "root": "config/client-data" }
@@ -244,6 +248,8 @@ mod tests {
         assert_eq!(config["reference"]["enabled"], json!(true));
         assert_eq!(config["reference"]["port"], json!(6904));
         assert_eq!(config["reference"]["wiki_root"], json!("wiki"));
+        assert_eq!(config["login"]["skip_account_ips"], json!(["127.0.0.1"]));
+        assert_eq!(config["login"]["new_account"], json!(true));
 
         let written = std::fs::read_to_string(settings.client_config_json()).unwrap();
         let config: Value = serde_json::from_str(&written).unwrap();

@@ -43,12 +43,18 @@ pub struct Settings {
     pub bot_api_port: u16,
     /// Port of the server's read-only reference (`/db`, `/wiki`), which the bots plan with.
     pub reference_port: u16,
+    /// Logins from this computer skip the account system (`login.skip_account_ips`): the client
+    /// asks only for a name, and an unknown name gets an account on first use.
+    pub ip_login: bool,
     /// Start rust-ro-bot once the server accepts connections.
     pub launch_bots: bool,
     /// Bots playing at once (`--bots`).
     pub bot_count: u32,
 
     pub build_release: bool,
+    /// "Play without updating": the launcher does not pull and rebuild when it starts. An install
+    /// that is not complete is still finished.
+    pub skip_update: bool,
     /// Start the game server with `--debug-log` (script failure diagnostics).
     pub debug_log: bool,
 
@@ -81,9 +87,11 @@ impl Default for Settings {
             bot_api_enabled: true,
             bot_api_port: 6902,
             reference_port: 6904,
+            ip_login: true,
             launch_bots: true,
             bot_count: 50,
             build_release: true,
+            skip_update: false,
             debug_log: false,
             server_repo: "https://github.com/pts1667/rust-ro.git".into(),
             client_repo: default_client_repo(),
@@ -277,6 +285,21 @@ impl Settings {
     }
 
     /// Address the client should use to reach the game server.
+    /// Addresses whose logins skip the account system: loopback, and the address the client
+    /// connects to when it is an IPv4 address of this machine (LAN play), since the client then
+    /// connects from it. Empty without `ip_login`.
+    pub fn ip_login_addresses(&self) -> Vec<String> {
+        if !self.ip_login {
+            return Vec::new();
+        }
+        let mut addresses = vec!["127.0.0.1".to_string()];
+        let connect = self.connect_host();
+        if connect.parse::<std::net::Ipv4Addr>().is_ok() && !addresses.contains(&connect) {
+            addresses.push(connect);
+        }
+        addresses
+    }
+
     pub fn connect_host(&self) -> String {
         let public = self.public_host.trim();
         if !public.is_empty() {
@@ -541,6 +564,23 @@ mod debug_log_tests {
 #[cfg(test)]
 mod bot_tests {
     use super::Settings;
+
+    #[test]
+    fn logins_from_this_computer_skip_the_account_system() {
+        let mut settings = Settings::default();
+        assert!(settings.ip_login);
+        assert_eq!(settings.ip_login_addresses(), ["127.0.0.1"]);
+
+        // LAN play: the client connects to (and so from) the machine's LAN address.
+        settings.public_host = "192.168.1.20".into();
+        assert_eq!(settings.ip_login_addresses(), ["127.0.0.1", "192.168.1.20"]);
+        // A host name is no address pattern the server accepts.
+        settings.public_host = "my-pc.local".into();
+        assert_eq!(settings.ip_login_addresses(), ["127.0.0.1"]);
+
+        settings.ip_login = false;
+        assert!(settings.ip_login_addresses().is_empty());
+    }
 
     #[test]
     fn bots_read_the_server_config_and_stop_on_stdin() {

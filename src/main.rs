@@ -41,10 +41,12 @@ fn main() -> eframe::Result<()> {
     }
 
     let options = eframe::NativeOptions {
+        // A launcher window: fixed size, and the app draws its own title bar.
         viewport: egui::ViewportBuilder::default()
-            .with_title("ro-sppack — Ragnarok Online setup & launcher")
-            .with_inner_size([1220.0, 820.0])
-            .with_min_inner_size([980.0, 640.0]),
+            .with_title("ro-sppack — Ragnarok Online launcher")
+            .with_inner_size([1120.0, 630.0])
+            .with_decorations(false)
+            .with_resizable(false),
         ..Default::default()
     };
     eframe::run_native(
