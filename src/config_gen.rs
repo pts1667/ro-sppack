@@ -6,7 +6,6 @@
 //! updates the connection and resource fields and preserves everything else
 //! (window state, keybindings, volumes, ...).
 
-use crate::assets;
 use crate::settings::Settings;
 
 use serde_json::{Value, json};
@@ -24,12 +23,14 @@ pub fn generate_all(settings: &Settings) -> Result<String, String> {
 
 /// Writes only `rust-ro/config.json`.
 pub fn generate_server(settings: &Settings) -> Result<(), String> {
+    settings.validate()?;
     create_directories(settings)?;
     generate_server_config(settings)
 }
 
 /// Patches the connection and resource fields of the client `config.json`.
 pub fn generate_client(settings: &Settings) -> Result<(), String> {
+    settings.validate()?;
     create_directories(settings)?;
     generate_client_config(settings)
 }
@@ -79,7 +80,28 @@ fn generate_server_config(settings: &Settings) -> Result<(), String> {
         config["game"]["job_exp_rate"] = json!(settings.job_exp_rate);
         config["game"]["drop_rate"] = json!(settings.drop_rate);
         config["game"]["drop_rate_card"] = json!(settings.drop_rate_card);
+        config["game"]["drop_rate_mvp"] = json!(settings.drop_rate_mvp);
         config["game"]["mob_density"] = json!(settings.mob_density);
+    }
+
+    // The server publishes the client data it extracted from the kRO archives. It listens on the
+    // same bind host as the game, and the client is pointed at it through `data_url`.
+    config["client_data"]["enabled"] = json!(true);
+    config["client_data"]["host"] = json!(settings.server_host);
+    config["client_data"]["port"] = json!(settings.client_data_port);
+    config["bots"]["enabled"] = json!(settings.bot_api_enabled);
+    config["bots"]["port"] = json!(settings.bot_api_port);
+    // The bots plan their trips with the reference's `/db`.
+    config["reference"]["enabled"] = json!(true);
+    config["reference"]["port"] = json!(settings.reference_port);
+    if settings.bot_api_enabled {
+        // The bots take turns with a pool of twice their number (`--pool`): every character of
+        // the pool must fit in `max_registered_bots`, and `max_bots` leaves room to spare.
+        let room = settings.bot_count as u64 * 2;
+        for key in ["max_bots", "max_registered_bots"] {
+            let current = config["bots"][key].as_u64().unwrap_or(0);
+            config["bots"][key] = json!(current.max(room));
+        }
     }
 
     let config_path = settings.server_config_json();
@@ -107,21 +129,16 @@ fn generate_client_config(settings: &Settings) -> Result<(), String> {
         "packetver": settings.packetver,
     }]);
 
-    // The client resolves data_dir first, then grf_paths in order.
-    let grfs = assets::grf_paths(settings);
-    if !grfs.is_empty() {
-        config["grf_paths"] = json!(grfs);
+    // Every resource comes from the server's `/data` endpoint. The client resolves data_dir first
+    // (the translation, when applied), then data_url, then grf_paths. Archives copied by earlier
+    // launcher versions are no longer listed, and the BGM tracks come from `bgm/` on the endpoint.
+    config["data_url"] = json!(settings.client_data_url());
+    config["grf_paths"] = json!([]);
+    if let Some(object) = config.as_object_mut() {
+        object.remove("bgm_path");
     }
     if settings.client_extracted_dir().is_dir() {
         config["data_dir"] = json!("data/extracted");
-    }
-    if settings.copy_bgm_ai && settings.client_bgm_dir().is_dir() {
-        config["bgm_path"] = json!("data/BGM");
-    } else {
-        let bgm = settings.assets_dir.join("BGM");
-        if bgm.is_dir() {
-            config["bgm_path"] = json!(bgm.display().to_string());
-        }
     }
     if config.get("emblem_path").is_none() {
         config["emblem_path"] = json!("data/emblem");
@@ -146,69 +163,66 @@ mod tests {
         dir
     }
 
-    #[test]
-    fn generates_patched_server_and_client_configs() {
-        let install = temp_dir("install");
-        let server = install.join("rust-ro");
-        std::fs::create_dir_all(&server).unwrap();
-        std::fs::write(
-            server.join("config.template.json"),
-            r#"{
-                "server": {
-                    "accounts": [],
-                    "host": "0.0.0.0",
-                    "port": 6901,
-                    "packetver": 20120229,
-                    "enable_legacy_proxy": true,
-                    "enable_websocket": true,
-                    "enable_visual_debugger": false,
-                    "log_level": "info",
-                    "trace_packet": false,
-                    "log_level_module_override": []
-                },
-                "game": {
-                    "base_exp_rate": 1.0,
-                    "job_exp_rate": 1.0,
-                    "drop_rate": 1.0,
-                    "drop_rate_card": 1.0,
-                    "mob_density": 1.0
-                }
-            }"#,
-        )
-        .unwrap();
+    const SERVER_TEMPLATE: &str = r#"{
+        "server": {
+            "accounts": [],
+            "host": "0.0.0.0",
+            "port": 6901,
+            "packetver": 20120229,
+            "enable_legacy_proxy": true,
+            "enable_websocket": true,
+            "enable_visual_debugger": false,
+            "log_level": "info",
+            "trace_packet": false,
+            "log_level_module_override": []
+        },
+        "game": {
+            "base_exp_rate": 1.0,
+            "job_exp_rate": 1.0,
+            "drop_rate": 1.0,
+            "drop_rate_card": 1.0,
+            "drop_rate_mvp": 1.0,
+            "mob_density": 1.0
+        },
+        "bots": { "enabled": false, "host": "127.0.0.1", "port": 6902, "max_bots": 20, "max_registered_bots": 200 },
+        "reference": { "enabled": true, "host": "127.0.0.1", "port": 6904, "wiki_root": "wiki" },
+        "client_data": { "enabled": false, "host": "127.0.0.1", "port": 6903, "root": "config/client-data" }
+    }"#;
 
-        // Assets manifest + extracted dir as prepared by the asset step.
-        let client = install.join("nostalro-client");
-        let client_data = client.join("data");
-        std::fs::create_dir_all(client_data.join("extracted")).unwrap();
-        std::fs::write(client_data.join("data.grf"), b"grf").unwrap();
-        std::fs::write(
-            client_data.join("ro-sppack-assets.json"),
-            r#"{"grf_paths": ["data/data.grf"]}"#,
-        )
-        .unwrap();
-        // A previous run's settings that must survive the patch.
+    /// An install with a cloned rust-ro (template only) and a client whose config carries
+    /// fields the launcher does not own.
+    fn install(label: &str) -> (std::path::PathBuf, Settings) {
+        let root = temp_dir(label);
+        let server = root.join("rust-ro");
+        std::fs::create_dir_all(&server).unwrap();
+        std::fs::write(server.join("config.template.json"), SERVER_TEMPLATE).unwrap();
+        // The client folder is cloned; an old copy-era config still lists archives and BGM.
+        let client = root.join("nostalro-client");
+        std::fs::create_dir_all(client.join("data").join("extracted")).unwrap();
         std::fs::write(
             client.join("config.json"),
-            r#"{"dpi_scale": 150.0, "bgm_path": "data/BGM"}"#,
+            r#"{"dpi_scale": 150.0, "bgm_path": "data/BGM", "grf_paths": ["data/data.grf"]}"#,
         )
         .unwrap();
-
-        let assets = install.join("assets");
-        std::fs::create_dir_all(assets.join("BGM")).unwrap();
-
         let settings = Settings {
-            install_dir: install.clone(),
-            assets_dir: assets.clone(),
+            install_dir: root.clone(),
             server_host: "0.0.0.0".into(),
             game_port: 7001,
+            client_data_port: 7003,
             packetver: 20120307,
             base_exp_rate: 100.0,
+            drop_rate_mvp: 5.0,
             ..Settings::default()
         };
+        (root, settings)
+    }
 
+    #[test]
+    fn generates_patched_server_and_client_configs() {
+        let (root, settings) = install("patched");
         generate_all(&settings).unwrap();
 
+        let server = settings.server_dir();
         let written = std::fs::read_to_string(server.join("config.json")).unwrap();
         let config: Value = serde_json::from_str(&written).unwrap();
         assert_eq!(config["server"]["port"], json!(7001));
@@ -217,22 +231,56 @@ mod tests {
         assert_eq!(config["server"]["enable_websocket"], json!(true));
         assert_eq!(config["server"]["accounts"][0], json!(2_000_000));
         assert_eq!(config["game"]["base_exp_rate"], json!(100.0));
+        assert_eq!(config["game"]["drop_rate_mvp"], json!(5.0));
+        assert_eq!(config["client_data"]["enabled"], json!(true));
+        assert_eq!(config["client_data"]["host"], json!("0.0.0.0"));
+        assert_eq!(config["client_data"]["port"], json!(7003));
+        assert_eq!(config["client_data"]["root"], json!("config/client-data"));
+        assert_eq!(config["bots"]["enabled"], json!(true));
+        assert_eq!(config["bots"]["port"], json!(6902));
+        // 50 bots by default: room for 100 in game, and the template's 200 registered is kept.
+        assert_eq!(config["bots"]["max_bots"], json!(100));
+        assert_eq!(config["bots"]["max_registered_bots"], json!(200));
+        assert_eq!(config["reference"]["enabled"], json!(true));
+        assert_eq!(config["reference"]["port"], json!(6904));
+        assert_eq!(config["reference"]["wiki_root"], json!("wiki"));
 
-        let written = std::fs::read_to_string(client.join("config.json")).unwrap();
+        let written = std::fs::read_to_string(settings.client_config_json()).unwrap();
         let config: Value = serde_json::from_str(&written).unwrap();
         assert_eq!(config["packetver"], json!(20120307));
         assert_eq!(config["login_servers"][0]["host"], json!("127.0.0.1"));
         assert_eq!(config["login_servers"][0]["port"], json!(7001));
         assert_eq!(config["login_servers"][0]["packetver"], json!(20120307));
-        assert_eq!(config["grf_paths"][0], json!("data/data.grf"));
+        assert_eq!(config["data_url"], json!("http://127.0.0.1:7003/data"));
+        assert_eq!(config["grf_paths"], json!([]));
+        assert!(config.get("bgm_path").is_none());
         assert_eq!(config["data_dir"], json!("data/extracted"));
-        assert_eq!(
-            config["bgm_path"],
-            json!(assets.join("BGM").display().to_string())
-        );
         // Untouched fields written by the client are preserved.
         assert_eq!(config["dpi_scale"], json!(150.0));
 
-        std::fs::remove_dir_all(&install).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn invalid_numbers_are_not_written() {
+        let (root, mut settings) = install("invalid");
+        settings.base_exp_rate = 10000.5;
+        assert!(generate_server(&settings).is_err());
+        assert!(!settings.server_config_json().exists());
+
+        settings.base_exp_rate = f32::NAN;
+        assert!(generate_server(&settings).is_err());
+
+        settings.base_exp_rate = 10000.0;
+        settings.client_data_port = settings.game_port;
+        let before = std::fs::read_to_string(settings.client_config_json()).unwrap();
+        let error = generate_client(&settings).unwrap_err();
+        assert!(error.contains("different ports"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(settings.client_config_json()).unwrap(),
+            before
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

@@ -1,9 +1,9 @@
-//! Preparing the native client's data: GRF archives, loose overrides and the
-//! English translation layers.
+//! The English translation layers and the client data build.
 //!
-//! The client resolves files in this order: `data_dir` (loose files that
-//! override archive entries) first, then every archive in `grf_paths` in
-//! order. Everything here works towards that layout.
+//! The native client reads loose files from `nostalro-client/data/extracted` first
+//! (the translation lands there), then the client data served by the server under
+//! `/data`. The server's `client-data-setup` tool builds that served tree from the
+//! kRO archives, so the launcher no longer copies archives into the client.
 
 use crate::events::AppEvent;
 use crate::settings::Settings;
@@ -23,45 +23,10 @@ struct CopyTask {
     skip: bool,
 }
 
-/// Archive paths as written into the client `config.json`, read from the
-/// manifest produced by [`copy_assets`].
-pub fn grf_paths(settings: &Settings) -> Vec<String> {
-    let path = settings.client_assets_manifest();
-    let Ok(text) = fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return Vec::new();
-    };
-    value
-        .get("grf_paths")
-        .and_then(|value| value.as_array())
-        .map(|list| {
-            list.iter()
-                .filter_map(|entry| entry.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Resolve a manifest entry to a file path. Relative entries are relative to
-/// the client directory, which is also its working directory.
-pub fn resolve_grf(settings: &Settings, entry: &str) -> PathBuf {
-    let path = Path::new(entry);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        settings.client_dir().join(path)
-    }
-}
-
-/// True when the manifest exists and every archive it lists is present.
-pub fn is_ready(settings: &Settings) -> bool {
-    let paths = grf_paths(settings);
-    !paths.is_empty()
-        && paths
-            .iter()
-            .all(|entry| resolve_grf(settings, entry).is_file())
+/// True once `client-data-setup` has written its manifest into the server's client data root.
+pub fn client_data_ready(settings: &Settings) -> bool {
+    let root = settings.server_client_data_dir();
+    root.join("manifest.json").is_file() && root.join("check.jsonl").is_file()
 }
 
 /// The `[Data]` section of a DATA.INI in index order (lower index wins).
@@ -99,166 +64,39 @@ pub fn parse_data_ini(content: &str) -> Vec<String> {
     entries.into_iter().map(|(_, value)| value).collect()
 }
 
-/// Prepare the client's `data/` folder: copy the archives (or reference them in
-/// place), copy loose overrides into `data/extracted`, optionally copy BGM, and
-/// write the manifest the configuration step reads.
-#[allow(clippy::too_many_arguments)]
-pub fn copy_assets(
-    id: u64,
-    source: &Path,
-    client_dir: &Path,
-    reference: bool,
-    copy_bgm_ai: bool,
-    copy_loose_data: bool,
-    tx: &Sender<AppEvent>,
-    ctx: &egui::Context,
-    cancel: &AtomicBool,
-) -> Result<String, String> {
-    if !source.is_dir() {
-        return Err(format!("assets folder not found: {}", source.display()));
-    }
-    let data_dir = client_dir.join("data");
-    fs::create_dir_all(&data_dir).map_err(|e| format!("create {}: {e}", data_dir.display()))?;
-
-    let grfs = collect_grfs(source)?;
-    if grfs.is_empty() {
-        return Err(format!(
-            "no GRF archives found: {} has no readable DATA.INI entries and no *.grf/*.gpf files",
-            source.display()
-        ));
-    }
-
-    let mut tasks: Vec<CopyTask> = Vec::new();
-    let mut grf_paths: Vec<String> = Vec::new();
-
-    if reference {
-        for grf in &grfs {
-            grf_paths.push(canonical_path(grf).display().to_string());
-        }
-    } else {
-        let mut used_names: Vec<String> = Vec::new();
-        for grf in &grfs {
-            let original = grf
-                .file_name()
-                .map(|name| name.to_string_lossy().to_string())
-                .unwrap_or_else(|| "archive.grf".to_string());
-            let name = unique_name(&original, &mut used_names);
-            let dst = data_dir.join(&name);
-            let size = fs::metadata(grf).map(|meta| meta.len()).unwrap_or(0);
-            let skip = dst.is_file()
-                && fs::metadata(&dst)
-                    .map(|meta| meta.len() == size)
-                    .unwrap_or(false);
-            tasks.push(CopyTask {
-                src: grf.clone(),
-                dst,
-                size,
-                skip,
-            });
-            grf_paths.push(format!("data/{name}"));
-        }
-    }
-
-    if copy_loose_data {
-        // `data_dir` mirrors the archive's `data/` folder, so loose files are
-        // copied without the leading `data/` component.
-        let loose = source.join("data");
-        if loose.is_dir() {
-            collect_tree(&loose, &data_dir.join("extracted"), &mut tasks)?;
-        }
-    }
-    if copy_bgm_ai {
-        let bgm = source.join("BGM");
-        if bgm.is_dir() {
-            collect_tree(&bgm, &data_dir.join("BGM"), &mut tasks)?;
-        }
-    }
-
-    let manifest = serde_json::json!({
-        "mode": if reference { "reference" } else { "copy" },
-        "source": source.display().to_string(),
-        "grf_paths": grf_paths,
-    });
-    let manifest_path = data_dir.join("ro-sppack-assets.json");
-    let text = serde_json::to_string_pretty(&manifest)
-        .map_err(|e| format!("serialize assets manifest: {e}"))?;
-    fs::write(&manifest_path, text)
-        .map_err(|e| format!("write {}: {e}", manifest_path.display()))?;
-
-    let total: u64 = tasks.iter().map(|task| task.size).sum();
-    let mut done: u64 = tasks
-        .iter()
-        .filter(|task| task.skip)
-        .map(|task| task.size)
-        .sum();
-    let mut last_report = Instant::now();
-    report(id, done, total, "preparing assets", tx, ctx);
-
-    for task in &tasks {
-        if cancel.load(Ordering::SeqCst) {
-            return Err("cancelled".into());
-        }
-        if task.skip {
-            continue;
-        }
-        copy_file(
-            task,
-            id,
-            &mut done,
-            total,
-            tx,
-            ctx,
-            cancel,
-            &mut last_report,
-        )?;
-    }
-
-    let mode = if reference { "referenced" } else { "copied" };
-    Ok(format!(
-        "{mode} {} archive(s); {} auxiliary file(s); {} total",
-        grfs.len(),
-        tasks
-            .len()
-            .saturating_sub(if reference { 0 } else { grfs.len() }),
-        human_bytes(total)
-    ))
-}
-
-/// Copy a translation layer's `data/` tree over the client's loose overrides.
-/// `source` is the repository root that contains `data/`; files are copied
-/// without the leading `data/` component, matching the client's `data_dir`.
+/// Copy translation layers' `data/` trees over the client's loose overrides.
+/// Each source is a repository directory that contains `data/`; files are
+/// copied without the leading `data/` component, matching the client's
+/// `data_dir`. Layers are applied in order, so a later layer overwrites
+/// earlier ones.
 ///
-/// Every file is rewritten (no size-based skipping): the PRE layer replaces RE
-/// files that may have the same size but different contents.
+/// Every file is rewritten (no size-based skipping): the pre-renewal layer
+/// replaces renewal files that may have the same size but different contents.
 pub fn copy_translation(
     id: u64,
-    source: &Path,
+    sources: &[PathBuf],
     extracted: &Path,
     marker: &Path,
     tx: &Sender<AppEvent>,
     ctx: &egui::Context,
     cancel: &AtomicBool,
 ) -> Result<String, String> {
-    if !source.is_dir() {
-        return Err(format!(
-            "translation repository not found: {}",
-            source.display()
-        ));
-    }
-    let data = source.join("data");
-    if !data.is_dir() {
-        return Err(format!(
-            "no data/ folder in translation repository: {}",
-            source.display()
-        ));
+    if sources.is_empty() {
+        return Err("no translation layers selected".into());
     }
 
     let mut tasks: Vec<CopyTask> = Vec::new();
-    collect_tree(&data, extracted, &mut tasks)?;
+    for source in sources {
+        let data = source.join("data");
+        if !data.is_dir() {
+            return Err(format!("translation layer not found: {}", data.display()));
+        }
+        collect_tree(&data, extracted, &mut tasks)?;
+    }
     if tasks.is_empty() {
         return Err(format!(
             "no files under {} in translation repository",
-            data.display()
+            sources[0].parent().unwrap_or(Path::new(".")).display()
         ));
     }
     for task in &mut tasks {
@@ -287,7 +125,10 @@ pub fn copy_translation(
     }
 
     let details = serde_json::json!({
-        "source": source.display().to_string(),
+        "sources": sources
+            .iter()
+            .map(|source| source.display().to_string())
+            .collect::<Vec<_>>(),
         "extracted": extracted.display().to_string(),
         "files": tasks.len(),
         "updated": tasks.len(),
@@ -310,7 +151,9 @@ pub fn copy_translation(
     ))
 }
 
-fn collect_grfs(source: &Path) -> Result<Vec<PathBuf>, String> {
+/// The archives of a kRO client folder in priority order: DATA.INI order, or every `.grf` when
+/// DATA.INI lists none.
+pub fn collect_grfs(source: &Path) -> Result<Vec<PathBuf>, String> {
     let ini = source.join("DATA.INI");
     let mut found: Vec<PathBuf> = Vec::new();
 
@@ -462,36 +305,6 @@ fn report(id: u64, done: u64, total: u64, note: &str, tx: &Sender<AppEvent>, ctx
     ctx.request_repaint();
 }
 
-fn unique_name(original: &str, used: &mut Vec<String>) -> String {
-    let lower = original.to_lowercase();
-    if !used.iter().any(|existing| existing == &lower) {
-        used.push(lower);
-        return original.to_string();
-    }
-    let path = Path::new(original);
-    let stem = path
-        .file_stem()
-        .map(|stem| stem.to_string_lossy().to_string())
-        .unwrap_or_else(|| "archive".into());
-    let extension = path
-        .extension()
-        .map(|extension| extension.to_string_lossy().to_string())
-        .unwrap_or_default();
-    for index in 2..10_000 {
-        let candidate = if extension.is_empty() {
-            format!("{stem}_{index}")
-        } else {
-            format!("{stem}_{index}.{extension}")
-        };
-        let lower = candidate.to_lowercase();
-        if !used.iter().any(|existing| existing == &lower) {
-            used.push(lower);
-            return candidate;
-        }
-    }
-    original.to_string()
-}
-
 fn has_archive_extension(path: &Path) -> bool {
     path.extension()
         .map(|extension| {
@@ -550,13 +363,6 @@ mod tests {
         dir
     }
 
-    fn settings_for(install: &Path) -> Settings {
-        Settings {
-            install_dir: install.to_path_buf(),
-            ..Settings::default()
-        }
-    }
-
     #[test]
     fn data_ini_is_sorted_by_numeric_index() {
         let parsed = parse_data_ini("[Data]\n2=data.grf\n0=custom.grf\n1=rdata.grf\n");
@@ -570,129 +376,126 @@ mod tests {
     }
 
     #[test]
-    fn copy_mode_writes_archives_loose_data_and_manifest() {
-        let root = temp_dir("assets-copy");
-        let source = root.join("kro");
-        let client = root.join("nostalro-client");
-        fs::create_dir_all(source.join("data").join("texture")).unwrap();
-        fs::write(source.join("DATA.INI"), "[Data]\n0=data.grf\n1=rdata.grf\n").unwrap();
-        fs::write(source.join("data.grf"), b"data").unwrap();
-        fs::write(source.join("rdata.grf"), b"rdata").unwrap();
-        fs::write(source.join("data").join("texture").join("x.bmp"), b"loose").unwrap();
+    fn archives_follow_data_ini_order() {
+        let root = temp_dir("assets-archives");
+        fs::write(root.join("DATA.INI"), "[Data]\n0=data.grf\n1=rdata.grf\n").unwrap();
+        fs::write(root.join("data.grf"), b"data").unwrap();
+        fs::write(root.join("rdata.grf"), b"rdata").unwrap();
+        fs::write(root.join("extra.grf"), b"not listed").unwrap();
 
-        let ctx = egui::Context::default();
-        let (tx, _rx) = mpsc::channel();
-        let cancel = AtomicBool::new(false);
-        let summary =
-            copy_assets(1, &source, &client, false, false, true, &tx, &ctx, &cancel).unwrap();
-        assert!(summary.contains("2 archive(s)"), "{summary}");
-        assert!(client.join("data").join("data.grf").is_file());
-        assert!(client.join("data").join("rdata.grf").is_file());
-        // Loose files lose the leading `data/` component.
-        assert_eq!(
-            fs::read_to_string(
-                client
-                    .join("data")
-                    .join("extracted")
-                    .join("texture")
-                    .join("x.bmp")
-            )
-            .unwrap(),
-            "loose"
-        );
-
-        let settings = settings_for(&root);
-        assert_eq!(
-            grf_paths(&settings),
-            vec!["data/data.grf", "data/rdata.grf"]
-        );
-        assert!(is_ready(&settings));
+        let names: Vec<String> = collect_grfs(&root)
+            .unwrap()
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["data.grf", "rdata.grf"]);
         fs::remove_dir_all(&root).ok();
     }
 
     #[test]
-    fn reference_mode_keeps_archives_in_place() {
-        let root = temp_dir("assets-reference");
-        let source = root.join("kro");
-        let client = root.join("nostalro-client");
-        fs::create_dir_all(&source).unwrap();
-        fs::write(source.join("DATA.INI"), "[Data]\n0=data.grf\n").unwrap();
-        fs::write(source.join("data.grf"), b"data").unwrap();
+    fn client_data_is_ready_once_the_setup_wrote_its_manifest() {
+        let root = temp_dir("assets-ready");
+        let settings = Settings {
+            install_dir: root.clone(),
+            ..Settings::default()
+        };
+        assert!(!client_data_ready(&settings));
 
-        let ctx = egui::Context::default();
-        let (tx, _rx) = mpsc::channel();
-        let cancel = AtomicBool::new(false);
-        copy_assets(1, &source, &client, true, false, true, &tx, &ctx, &cancel).unwrap();
-
-        let settings = settings_for(&root);
-        let paths = grf_paths(&settings);
-        assert_eq!(paths.len(), 1);
-        assert!(Path::new(&paths[0]).is_absolute(), "{paths:?}");
-        assert!(is_ready(&settings));
-        assert!(!client.join("data").join("data.grf").exists());
+        let tree = settings.server_client_data_dir();
+        fs::create_dir_all(&tree).unwrap();
+        fs::write(tree.join("manifest.json"), "{}").unwrap();
+        assert!(
+            !client_data_ready(&settings),
+            "check.jsonl is still missing"
+        );
+        fs::write(tree.join("check.jsonl"), "").unwrap();
+        assert!(client_data_ready(&settings));
         fs::remove_dir_all(&root).ok();
     }
 
     #[test]
-    fn translation_copy_overrides_loose_files_and_writes_marker() {
+    fn translation_layers_override_loose_files_and_write_marker() {
         let root = temp_dir("translation");
-        let source = root.join("ROenglishPRE");
+        let repo = root.join("ROenglishRE");
+        let renewal = repo.join("Translation").join("Renewal");
+        let pre = repo.join("Translation").join("Pre-Renewal");
+        let compat = repo
+            .join("Translation")
+            .join("Compatibility")
+            .join("2012-04-10")
+            .join("Pre-Renewal");
         let extracted = root.join("nostalro-client").join("data").join("extracted");
-        let marker = root.join("translation-pre.json");
-        fs::create_dir_all(source.join("data").join("lua files")).unwrap();
-        fs::create_dir_all(source.join("System")).unwrap();
+        let marker = root.join("translation.json");
+
+        // Renewal base: message table and a lua table.
+        fs::create_dir_all(renewal.join("data").join("lua files")).unwrap();
+        fs::write(renewal.join("data").join("msgstringtable.txt"), "hello").unwrap();
         fs::write(
-            source.join("data").join("num2itemdesctable.txt"),
-            "translated",
-        )
-        .unwrap();
-        fs::write(
-            source
+            renewal
                 .join("data")
                 .join("lua files")
                 .join("skillinfolist.lub"),
-            "lub data",
+            "renewal!",
         )
         .unwrap();
-        fs::write(source.join("System").join("itemInfo.lua"), "item info").unwrap();
 
-        // An existing loose (Korean) file must be replaced by the translation.
+        // Pre-renewal overlay: a same-size replacement plus its own file.
+        fs::create_dir_all(pre.join("data").join("lua files")).unwrap();
+        fs::write(
+            pre.join("data").join("lua files").join("skillinfolist.lub"),
+            "prelayer",
+        )
+        .unwrap();
+        fs::write(pre.join("data").join("skillnametable.txt"), "skills").unwrap();
+
+        // Compatibility: the classic item tables a 2012-era client reads.
+        fs::create_dir_all(compat.join("data")).unwrap();
+        fs::write(
+            compat.join("data").join("num2itemdesctable.txt"),
+            "translated",
+        )
+        .unwrap();
+
+        // Existing loose (Korean) files must be replaced by the translation.
         fs::create_dir_all(&extracted).unwrap();
         fs::write(extracted.join("num2itemdesctable.txt"), "korean").unwrap();
+        fs::write(extracted.join("msgstringtable.txt"), "korean msg").unwrap();
 
+        let sources = vec![renewal, pre, compat];
         let ctx = egui::Context::default();
         let (tx, _rx) = mpsc::channel();
         let cancel = AtomicBool::new(false);
         let summary =
-            copy_translation(1, &source, &extracted, &marker, &tx, &ctx, &cancel).unwrap();
-        assert!(summary.contains("2 file(s)"), "{summary}");
+            copy_translation(1, &sources, &extracted, &marker, &tx, &ctx, &cancel).unwrap();
+        assert!(summary.contains("5 file(s)"), "{summary}");
+        assert_eq!(
+            fs::read_to_string(extracted.join("msgstringtable.txt")).unwrap(),
+            "hello"
+        );
         assert_eq!(
             fs::read_to_string(extracted.join("num2itemdesctable.txt")).unwrap(),
             "translated"
         );
-        assert!(
-            extracted
-                .join("lua files")
-                .join("skillinfolist.lub")
-                .is_file()
+        assert_eq!(
+            fs::read_to_string(extracted.join("skillnametable.txt")).unwrap(),
+            "skills"
         );
-        // System/ is for the 2013+ official client; the native client ignores it.
-        assert!(!extracted.join("System").exists());
-        assert!(marker.is_file());
-
-        // Same-size changes still win (this is how the PRE layer overrides RE).
-        fs::write(
-            source
-                .join("data")
-                .join("lua files")
-                .join("skillinfolist.lub"),
-            "LUB DATA",
-        )
-        .unwrap();
-        copy_translation(2, &source, &extracted, &marker, &tx, &ctx, &cancel).unwrap();
+        // The pre-renewal layer wins over the renewal base even at equal size.
         assert_eq!(
             fs::read_to_string(extracted.join("lua files").join("skillinfolist.lub")).unwrap(),
-            "LUB DATA"
+            "prelayer"
+        );
+
+        let recorded: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&marker).unwrap()).unwrap();
+        assert_eq!(recorded["sources"].as_array().unwrap().len(), 3);
+        assert_eq!(recorded["extracted"], extracted.display().to_string());
+
+        // Re-running keeps the same layering result.
+        copy_translation(2, &sources, &extracted, &marker, &tx, &ctx, &cancel).unwrap();
+        assert_eq!(
+            fs::read_to_string(extracted.join("lua files").join("skillinfolist.lub")).unwrap(),
+            "prelayer"
         );
         fs::remove_dir_all(&root).ok();
     }

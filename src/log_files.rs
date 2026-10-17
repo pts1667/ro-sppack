@@ -8,14 +8,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const FLUSH_INTERVAL: Duration = Duration::from_secs(10);
-const PROCESS_SOURCES: [&str; 2] = ["server", "client"];
+const PROCESS_SOURCES: [&str; 3] = ["server", "client", "bots"];
 
 struct State {
     dir: PathBuf,
     writers: HashMap<&'static str, BufWriter<File>>,
 }
 
-/// Appends log lines to `server.log`, `client.log` and `launcher.log`; a background thread flushes them every
+/// Appends log lines to `server.log`, `client.log`, `bots.log` and `launcher.log`; a background thread flushes them every
 /// ten seconds so the files can be read while the game runs. The previous run's file is kept as `<name>.previous.log`.
 pub struct LogFiles {
     state: Mutex<State>,
@@ -152,6 +152,7 @@ mod tests {
     fn routes_processes_to_their_own_file_and_everything_else_to_the_launcher_file() {
         assert_eq!(file_name("server"), "server");
         assert_eq!(file_name("client"), "client");
+        assert_eq!(file_name("bots"), "bots");
         assert_eq!(file_name("job"), "launcher");
         assert_eq!(file_name("setup"), "launcher");
     }

@@ -5,21 +5,37 @@ use crate::config_gen;
 use crate::events::{AppEvent, LogLevel};
 use crate::jobs::{JobKind, JobRunner, kill_pid};
 use crate::log_files::LogFiles;
-use crate::settings::{AssetMode, Settings};
+use crate::settings::{
+    BOT_COUNT_RANGE, MOB_DENSITY_RANGE, PACKETVER_RANGE, PORT_RANGE, RATE_RANGE, Settings,
+};
 
 use eframe::egui;
 use egui::{Color32, RichText};
 use std::collections::VecDeque;
+use std::fmt::Display;
+use std::io::Write;
+use std::net::{TcpStream, ToSocketAddrs};
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{ChildStdin, Command, Stdio};
+use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const OK: Color32 = Color32::from_rgb(0x66, 0xBB, 0x6A);
 const WARN: Color32 = Color32::from_rgb(0xE5, 0xC0, 0x7B);
 const BAD: Color32 = Color32::from_rgb(0xEF, 0x53, 0x50);
 const MUTED: Color32 = Color32::from_rgb(0x9E, 0x9E, 0x9E);
+
+/// How long a freshly started server may take to accept connections before the launcher gives up.
+const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(120);
+const SERVER_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const PORT_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+/// How long the bots may take to finish their step, save and log out before they are killed.
+const BOT_LOGOUT_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -54,10 +70,32 @@ pub struct App {
     ctx: egui::Context,
     queue: VecDeque<(String, JobKind)>,
 
+    /// Kept until the process exits, also while it is stopping.
     server_pid: Option<u32>,
     server_started: Option<Instant>,
+    /// Set by the server's wait thread once it exited.
+    server_exited: Arc<AtomicBool>,
+    server_stopping: bool,
     client_pid: Option<u32>,
     client_started: Option<Instant>,
+    /// Kept until the process exits, also while the bots log out.
+    bot_pid: Option<u32>,
+    bot_started: Option<Instant>,
+    bot_exited: Arc<AtomicBool>,
+    /// A line `stop` here, or closing it, logs the bots out (`--stop-on-stdin`).
+    bot_stdin: Option<ChildStdin>,
+    bots_stopping: bool,
+    /// Counts server starts and stops, so a readiness check for an earlier server is ignored.
+    server_gen: u64,
+    /// The server's game and client data ports have accepted connections.
+    server_ready: bool,
+    /// The client was asked to start while the server was still initializing.
+    client_waiting: bool,
+    /// The bots were asked to start while the server was still initializing.
+    bots_waiting: bool,
+    /// Threads that wait for processes to exit and kill them after a grace period. Joined on exit,
+    /// so the launcher does not leave a server running.
+    stoppers: Vec<JoinHandle<()>>,
 }
 
 impl App {
@@ -88,8 +126,20 @@ impl App {
             queue: VecDeque::new(),
             server_pid: None,
             server_started: None,
+            server_exited: Arc::new(AtomicBool::new(false)),
+            server_stopping: false,
             client_pid: None,
             client_started: None,
+            bot_pid: None,
+            bot_started: None,
+            bot_exited: Arc::new(AtomicBool::new(false)),
+            bot_stdin: None,
+            bots_stopping: false,
+            server_gen: 0,
+            server_ready: false,
+            client_waiting: false,
+            bots_waiting: false,
+            stoppers: Vec::new(),
         };
 
         app.push_log(
@@ -167,14 +217,49 @@ impl App {
                     }
                 }
                 AppEvent::ProcLog { name, line } => self.push_log_line(&name, line, LogLevel::Info),
+                AppEvent::ServerReady { generation, result } => {
+                    if generation != self.server_gen || self.server_pid.is_none() {
+                        continue;
+                    }
+                    match result {
+                        Ok(()) => {
+                            self.server_ready = true;
+                            self.push_log(
+                                "server",
+                                "accepting connections".into(),
+                                LogLevel::Success,
+                            );
+                            if std::mem::take(&mut self.client_waiting) {
+                                self.start_client();
+                            }
+                            if std::mem::take(&mut self.bots_waiting) || self.settings.launch_bots {
+                                self.start_bots();
+                            }
+                        }
+                        Err(error) => {
+                            self.client_waiting = false;
+                            self.bots_waiting = false;
+                            self.push_log(
+                                "server",
+                                format!("{error}; client and bots not started"),
+                                LogLevel::Error,
+                            );
+                        }
+                    }
+                }
                 AppEvent::ProcExited { name, code } => {
                     if name == "server" {
-                        self.server_pid = None;
-                        self.server_started = None;
+                        self.forget_server();
                     }
                     if name == "client" {
                         self.client_pid = None;
                         self.client_started = None;
+                    }
+                    if name == "bots" {
+                        self.bot_pid = None;
+                        self.bot_started = None;
+                        self.bot_stdin = None;
+                        self.bots_stopping = false;
                     }
                     let level = if code == Some(0) {
                         LogLevel::Info
@@ -198,6 +283,46 @@ impl App {
                     LogLevel::Warn,
                 );
             }
+            self.apply_configs();
+        }
+    }
+
+    /// Writes the server and client configuration as soon as a menu value changes, so the files
+    /// match the menu without waiting for the next start. A running server reads its configuration
+    /// only at startup, so it is told to restart.
+    fn apply_configs(&mut self) {
+        let settings = self.settings.clone();
+        if let Err(error) = settings.validate() {
+            self.push_log(
+                "launcher",
+                format!("configuration not written: {error}"),
+                LogLevel::Warn,
+            );
+            return;
+        }
+        if settings.server_cloned() {
+            match config_gen::generate_server(&settings) {
+                Ok(()) if self.server_pid.is_some() => self.push_log(
+                    "server",
+                    "configuration updated; restart the server to apply it".into(),
+                    LogLevel::Info,
+                ),
+                Ok(()) => {}
+                Err(error) => self.push_log(
+                    "server",
+                    format!("configuration failed: {error}"),
+                    LogLevel::Error,
+                ),
+            }
+        }
+        if settings.client_cloned()
+            && let Err(error) = config_gen::generate_client(&settings)
+        {
+            self.push_log(
+                "client",
+                format!("configuration failed: {error}"),
+                LogLevel::Error,
+            );
         }
     }
 
@@ -221,7 +346,7 @@ impl App {
         if self.settings.assets_dir.as_os_str().is_empty() {
             self.push_log(
                 "setup",
-                "No assets folder selected: game archives will not be prepared.".into(),
+                "No assets folder selected: the client data will not be built.".into(),
                 LogLevel::Warn,
             );
         }
@@ -256,22 +381,32 @@ impl App {
             );
             return;
         }
-        if let Some(pid) = self.spawn_managed(
+        if let Some(spawned) = self.spawn_managed(
             "server",
             settings.server_bin(),
             settings.server_dir(),
             settings.server_args(),
-            Vec::new(),
+            false,
         ) {
-            self.server_pid = Some(pid);
+            self.server_pid = Some(spawned.pid);
+            self.server_exited = spawned.exited;
             self.server_started = Some(Instant::now());
+            self.server_gen += 1;
+            self.server_ready = false;
             self.push_log(
                 "server",
                 format!(
-                    "game server listening on {}:{}",
+                    "game server starting on {}:{}",
                     settings.server_host, settings.game_port
                 ),
                 LogLevel::Success,
+            );
+            spawn_readiness_check(
+                self.tx.clone(),
+                self.ctx.clone(),
+                self.server_gen,
+                settings.server_probe_host(),
+                settings.server_ports(),
             );
         }
     }
@@ -300,15 +435,28 @@ impl App {
             );
             return;
         }
+        // The client logs in to the game server and reads /data from it, so it waits until both ports
+        // accept connections. ServerReady starts it then.
+        if self.server_pid.is_some() && !self.server_ready {
+            if !self.client_waiting {
+                self.client_waiting = true;
+                self.push_log(
+                    "client",
+                    "waiting for the game server to finish starting…".into(),
+                    LogLevel::Info,
+                );
+            }
+            return;
+        }
         // The client reads config.json and data/ relative to its working dir.
-        if let Some(pid) = self.spawn_managed(
+        if let Some(spawned) = self.spawn_managed(
             "client",
             settings.client_bin(),
             settings.client_dir(),
             Vec::new(),
-            Vec::new(),
+            false,
         ) {
-            self.client_pid = Some(pid);
+            self.client_pid = Some(spawned.pid);
             self.client_started = Some(Instant::now());
             self.push_log(
                 "client",
@@ -322,24 +470,105 @@ impl App {
         }
     }
 
+    /// Starts rust-ro-bot once the server accepts connections: it needs the Bot API, the reference
+    /// and the API key the server writes on its first start.
+    fn start_bots(&mut self) {
+        if self.bot_pid.is_some() {
+            return;
+        }
+        let settings = self.settings.clone();
+        if !settings.bot_built() {
+            self.push_log(
+                "bots",
+                format!(
+                    "binary not found: {} (build it in the Setup tab)",
+                    settings.bot_bin().display()
+                ),
+                LogLevel::Warn,
+            );
+            return;
+        }
+        if !settings.bot_api_enabled {
+            self.push_log(
+                "bots",
+                "not started: the Bot API is disabled in the server settings".into(),
+                LogLevel::Warn,
+            );
+            return;
+        }
+        if self.server_pid.is_none() || self.server_stopping {
+            self.push_log(
+                "bots",
+                "not started: start the game server first".into(),
+                LogLevel::Warn,
+            );
+            return;
+        }
+        if !self.server_ready {
+            if !self.bots_waiting {
+                self.bots_waiting = true;
+                self.push_log(
+                    "bots",
+                    "waiting for the game server to finish starting…".into(),
+                    LogLevel::Info,
+                );
+            }
+            return;
+        }
+        if !settings.bot_api_key_file().is_file() {
+            self.push_log(
+                "bots",
+                format!(
+                    "not started: the server wrote no API key at {}",
+                    settings.bot_api_key_file().display()
+                ),
+                LogLevel::Error,
+            );
+            return;
+        }
+        // The bots read names.txt from their working directory and keep their memory (state/) and
+        // the reference cache (cache/) there.
+        if let Some(spawned) = self.spawn_managed(
+            "bots",
+            settings.bot_bin(),
+            settings.bot_dir(),
+            settings.bot_args(),
+            true,
+        ) {
+            self.bot_pid = Some(spawned.pid);
+            self.bot_exited = spawned.exited;
+            self.bot_stdin = spawned.stdin;
+            self.bots_stopping = false;
+            self.bot_started = Some(Instant::now());
+            self.push_log(
+                "bots",
+                format!(
+                    "{} bots joining the game server in {}",
+                    settings.bot_count,
+                    settings.server_dir().display()
+                ),
+                LogLevel::Success,
+            );
+        }
+    }
+
+    /// Starts a process whose output goes to the Logs tab. With `stdin`, the launcher keeps a pipe
+    /// to its standard input.
     fn spawn_managed(
         &mut self,
         name: &'static str,
         program: std::path::PathBuf,
         cwd: std::path::PathBuf,
         args: Vec<String>,
-        env: Vec<(String, String)>,
-    ) -> Option<u32> {
+        stdin: bool,
+    ) -> Option<Spawned> {
         let mut command = Command::new(&program);
         command
             .args(&args)
             .current_dir(&cwd)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .stdin(Stdio::null());
-        for (key, value) in env {
-            command.env(key, value);
-        }
+            .stdin(if stdin { Stdio::piped() } else { Stdio::null() });
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -367,15 +596,20 @@ impl App {
                 if let Some(stderr) = child.stderr.take() {
                     spawn_process_reader(stderr, name.to_string(), tx.clone(), ctx.clone(), sink);
                 }
+                let stdin = child.stdin.take();
+                let exited = Arc::new(AtomicBool::new(false));
+                let exited_flag = Arc::clone(&exited);
                 std::thread::spawn(move || {
                     let status = child.wait();
+                    // Set while `child` still holds the process handle, so the pid is not reused yet.
+                    exited_flag.store(true, Ordering::SeqCst);
                     let _ = tx.send(AppEvent::ProcExited {
                         name: name.to_string(),
                         code: status.ok().and_then(|status| status.code()),
                     });
                     ctx.request_repaint();
                 });
-                Some(pid)
+                Some(Spawned { pid, exited, stdin })
             }
             Err(error) => {
                 self.push_log(
@@ -388,11 +622,55 @@ impl App {
         }
     }
 
+    /// Logs the bots out first, while the server still answers them, then kills the server. The
+    /// server keeps its pid until it exited, so no new server starts on its ports meanwhile.
     fn stop_server(&mut self) {
-        if let Some(pid) = self.server_pid.take() {
-            kill_pid(pid);
-            self.server_started = None;
-            self.push_log("server", "stopping…".into(), LogLevel::Warn);
+        let Some(pid) = self.server_pid else {
+            return;
+        };
+        if self.server_stopping {
+            return;
+        }
+        self.server_stopping = true;
+        self.push_log("server", "stopping…".into(), LogLevel::Warn);
+        self.abandon_server();
+        let bots = self.request_bot_logout();
+        let exited = Arc::clone(&self.server_exited);
+        self.stoppers.push(std::thread::spawn(move || {
+            if let Some((bot_pid, bot_exited)) = bots {
+                wait_or_kill(bot_pid, &bot_exited, BOT_LOGOUT_TIMEOUT);
+            }
+            wait_or_kill(pid, &exited, Duration::ZERO);
+        }));
+    }
+
+    /// The server exited: clears its state, and running bots log out.
+    fn forget_server(&mut self) {
+        self.server_pid = None;
+        self.server_started = None;
+        self.server_stopping = false;
+        self.abandon_server();
+        self.stop_bots();
+    }
+
+    /// A server on its way out: a readiness check still running for it is ignored, and a client or
+    /// bots waiting for it are not started.
+    fn abandon_server(&mut self) {
+        self.server_ready = false;
+        self.server_gen += 1;
+        if std::mem::take(&mut self.client_waiting) {
+            self.push_log(
+                "client",
+                "not started: the game server stopped".into(),
+                LogLevel::Warn,
+            );
+        }
+        if std::mem::take(&mut self.bots_waiting) {
+            self.push_log(
+                "bots",
+                "not started: the game server stopped".into(),
+                LogLevel::Warn,
+            );
         }
     }
 
@@ -404,9 +682,39 @@ impl App {
         }
     }
 
+    /// Logs the bots out: each finishes its step, saves its memory and leaves the game. They are
+    /// killed if they still run after `BOT_LOGOUT_TIMEOUT`.
+    fn stop_bots(&mut self) {
+        let first = !self.bots_stopping;
+        if let Some((pid, exited)) = self.request_bot_logout()
+            && first
+        {
+            self.stoppers.push(std::thread::spawn(move || {
+                wait_or_kill(pid, &exited, BOT_LOGOUT_TIMEOUT);
+            }));
+        }
+    }
+
+    /// Sends the running bots `stop` and closes their stdin. Returns their pid and exit flag for
+    /// whoever waits for them.
+    fn request_bot_logout(&mut self) -> Option<(u32, Arc<AtomicBool>)> {
+        self.bots_waiting = false;
+        let pid = self.bot_pid?;
+        if !self.bots_stopping {
+            self.bots_stopping = true;
+            if let Some(mut stdin) = self.bot_stdin.take() {
+                let _ = stdin.write_all(b"stop\n");
+            }
+            self.push_log("bots", "logging out…".into(), LogLevel::Warn);
+        }
+        Some((pid, Arc::clone(&self.bot_exited)))
+    }
+
+    /// Stops everything; the bots log out before the server goes down.
     fn stop_all(&mut self) {
         self.stop_server();
         self.stop_client();
+        self.stop_bots();
     }
 
     fn launch_game(&mut self) {
@@ -420,9 +728,12 @@ impl App {
             return;
         }
 
-        // start_server / start_client each regenerate their own configuration.
+        // start_server / start_client each regenerate their own configuration. start_client waits
+        // for the server to accept connections, so the client is not started if the server failed.
         self.start_server();
-        self.start_client();
+        if self.server_pid.is_some() {
+            self.start_client();
+        }
     }
 
     /// True when every component is built and the game assets are prepared.
@@ -430,7 +741,8 @@ impl App {
         let settings = &self.settings;
         settings.server_built()
             && settings.client_built()
-            && assets::is_ready(settings)
+            && (!settings.launch_bots || settings.bot_built())
+            && assets::client_data_ready(settings)
             && (!settings.install_translation || settings.translation_applied())
     }
 
@@ -493,8 +805,14 @@ impl App {
                 );
                 status_line(
                     ui,
-                    "game assets",
-                    assets::is_ready(&settings),
+                    "rust-ro-bot",
+                    settings.bot_built(),
+                    settings.bot_cloned(),
+                );
+                status_line(
+                    ui,
+                    "client data",
+                    assets::client_data_ready(&settings),
                     !settings.assets_dir.as_os_str().is_empty(),
                 );
                 if settings.install_translation {
@@ -502,15 +820,28 @@ impl App {
                         ui,
                         "translation",
                         settings.translation_applied(),
-                        settings.translation_re_cloned() && settings.translation_pre_cloned(),
+                        settings.translation_cloned(),
                     );
                 }
                 ui.add_space(10.0);
                 ui.separator();
                 ui.add_space(6.0);
                 ui.label(RichText::new("Processes").strong());
-                process_line(ui, "server", self.server_pid, self.server_started);
-                process_line(ui, "client", self.client_pid, self.client_started);
+                process_line(
+                    ui,
+                    "server",
+                    self.server_pid,
+                    self.server_started,
+                    self.server_stopping,
+                );
+                process_line(ui, "client", self.client_pid, self.client_started, false);
+                process_line(
+                    ui,
+                    "bots",
+                    self.bot_pid,
+                    self.bot_started,
+                    self.bots_stopping,
+                );
             });
     }
 
@@ -631,51 +962,84 @@ impl App {
                         ui.end_row();
 
                         ui.label("Game port");
-                        ui.add(egui::DragValue::new(&mut self.settings.game_port).range(1..=65535));
+                        ui.horizontal(|ui| {
+                            checked_field(ui, "game_port", &mut self.settings.game_port, PORT_RANGE);
+                        });
+                        ui.end_row();
+
+                        ui.label("Client data port");
+                        ui.horizontal(|ui| {
+                            checked_field(ui, "client_data_port", &mut self.settings.client_data_port, PORT_RANGE);
+                        })
+                        .response
+                        .on_hover_text("Serves the game data the client downloads (the client's data_url).");
+                        ui.end_row();
+
+                        ui.label("Bot API");
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.settings.bot_api_enabled, "enabled")
+                                .on_hover_text("The /bots API lets an external program play characters. Unticked, the server does not open its port.");
+                            checked_field(ui, "bot_api_port", &mut self.settings.bot_api_port, PORT_RANGE);
+                        });
+                        ui.end_row();
+
+                        ui.label("Reference port");
+                        ui.horizontal(|ui| {
+                            checked_field(ui, "reference_port", &mut self.settings.reference_port, PORT_RANGE);
+                        })
+                        .response
+                        .on_hover_text("Serves the game data as JSON (/db) and the wiki (/wiki). The bots plan with it.");
+                        ui.end_row();
+
+                        ui.label("Bots");
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.settings.launch_bots, "start with the server")
+                                .on_hover_text("Starts rust-ro-bot once the server accepts connections. The bots talk and pick some goals with the decision model at 127.0.0.1:9931; without it they play by the rules alone.");
+                            checked_field(ui, "bot_count", &mut self.settings.bot_count, BOT_COUNT_RANGE);
+                            ui.label(RichText::new("playing at once").small().color(MUTED));
+                        });
                         ui.end_row();
 
                         ui.label("Packet version");
-                        ui.add(egui::DragValue::new(&mut self.settings.packetver).speed(1.0));
+                        ui.horizontal(|ui| {
+                            checked_field(ui, "packetver", &mut self.settings.packetver, PACKETVER_RANGE);
+                        });
                         ui.end_row();
 
                         ui.label("Base EXP rate");
-                        ui.add(
-                            egui::DragValue::new(&mut self.settings.base_exp_rate)
-                                .speed(0.1)
-                                .range(0.0..=1000.0),
-                        );
+                        ui.horizontal(|ui| {
+                            checked_field(ui, "base_exp_rate", &mut self.settings.base_exp_rate, RATE_RANGE);
+                        });
                         ui.end_row();
 
                         ui.label("Job EXP rate");
-                        ui.add(
-                            egui::DragValue::new(&mut self.settings.job_exp_rate)
-                                .speed(0.1)
-                                .range(0.0..=1000.0),
-                        );
+                        ui.horizontal(|ui| {
+                            checked_field(ui, "job_exp_rate", &mut self.settings.job_exp_rate, RATE_RANGE);
+                        });
                         ui.end_row();
 
                         ui.label("Drop rate");
-                        ui.add(
-                            egui::DragValue::new(&mut self.settings.drop_rate)
-                                .speed(0.1)
-                                .range(0.0..=1000.0),
-                        );
+                        ui.horizontal(|ui| {
+                            checked_field(ui, "drop_rate", &mut self.settings.drop_rate, RATE_RANGE);
+                        });
                         ui.end_row();
 
                         ui.label("Card drop rate");
-                        ui.add(
-                            egui::DragValue::new(&mut self.settings.drop_rate_card)
-                                .speed(0.1)
-                                .range(0.0..=1000.0),
-                        );
+                        ui.horizontal(|ui| {
+                            checked_field(ui, "drop_rate_card", &mut self.settings.drop_rate_card, RATE_RANGE);
+                        });
+                        ui.end_row();
+
+                        ui.label("MVP drop rate");
+                        ui.horizontal(|ui| {
+                            checked_field(ui, "drop_rate_mvp", &mut self.settings.drop_rate_mvp, RATE_RANGE);
+                        });
                         ui.end_row();
 
                         ui.label("Mob density");
-                        ui.add(
-                            egui::DragValue::new(&mut self.settings.mob_density)
-                                .speed(0.1)
-                                .range(0.0..=10.0),
-                        );
+                        ui.horizontal(|ui| {
+                            checked_field(ui, "mob_density", &mut self.settings.mob_density, MOB_DENSITY_RANGE);
+                        });
                         ui.end_row();
 
                         ui.label("Options");
@@ -689,6 +1053,13 @@ impl App {
                         ui.end_row();
                     });
                 ui.label(
+                    RichText::new(
+                        "Rates are multipliers from 0.0 to 10000.0. Changes are written to the configuration files at once; a running server applies them after a restart.",
+                    )
+                    .small()
+                    .color(MUTED),
+                );
+                ui.label(
                     RichText::new("In-game login: admin / qwertz (account 2000000).")
                         .small()
                         .color(MUTED),
@@ -696,43 +1067,23 @@ impl App {
             });
 
             ui.add_space(8.0);
-            ui.label(RichText::new("Game assets").strong());
+            ui.label(RichText::new("Client data").strong());
             ui.group(|ui| {
-                ui.horizontal(|ui| {
-                    ui.selectable_value(
-                        &mut self.settings.asset_mode,
-                        AssetMode::Copy,
-                        "Copy archives into the package",
-                    );
-                    ui.selectable_value(
-                        &mut self.settings.asset_mode,
-                        AssetMode::Reference,
-                        "Reference archives in place",
-                    );
-                });
                 ui.label(
                     RichText::new(
-                        "Archives land in nostalro-client/data/ (or stay where they are and are referenced by absolute path).",
+                        "The server builds the game data from your kRO folder (rust-ro tools/client-data) and serves it on the client data port. The client downloads what it needs from there, so no archives are copied into nostalro-client.",
                     )
                     .small()
                     .color(MUTED),
                 );
-                ui.checkbox(
-                    &mut self.settings.copy_loose_data,
-                    "Copy loose data/ overrides into data/extracted/",
-                );
-                ui.checkbox(
-                    &mut self.settings.copy_bgm_ai,
-                    "Copy BGM/ into the package (otherwise referenced in place)",
-                );
                 ui.add_space(4.0);
                 ui.checkbox(
                     &mut self.settings.install_translation,
-                    "Install the English translation (ROenglishRE + ROenglishPRE)",
+                    "Install the English translation (ROenglishRE · Pre-Renewal)",
                 );
                 ui.label(
                     RichText::new(
-                        "Cloned during setup and copied over data/extracted/ (item, skill and message tables, interface textures) — no GRF repacking needed. ROenglishPRE is layered on top of ROenglishRE. Enabled by default on English systems.",
+                        "Cloned during setup and layered over nostalro-client/data/extracted/, which the client reads before the served data: Renewal base, then the Pre-Renewal files, then the 2012-era compatibility tables (item/skill/message text). Enabled by default on English systems.",
                     )
                     .small()
                     .color(MUTED),
@@ -806,7 +1157,7 @@ impl App {
             }
             ui.label(
                 RichText::new(
-                    "Installs whatever is missing: repositories, builds and game assets.",
+                    "Installs whatever is missing: repositories, builds, client data and translation.",
                 )
                 .small()
                 .color(MUTED),
@@ -903,21 +1254,69 @@ impl App {
         }
         ui.separator();
 
-        // Assets -----------------------------------------------------------------
+        // Bots -------------------------------------------------------------------
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Game assets").strong());
-            let ready = assets::is_ready(&settings);
+            ui.label(RichText::new("Bots · rust-ro-bot").strong());
+            state_chip(ui, settings.bot_built(), settings.bot_cloned());
+        });
+        ui.label(
+            RichText::new(settings.bot_dir().display().to_string())
+                .small()
+                .color(MUTED),
+        );
+        if settings.bot_cloned() {
+            ui.horizontal(|ui| {
+                if ui.button("Build").clicked() {
+                    self.enqueue(
+                        "Build rust-ro-bot",
+                        JobKind::CargoBuild {
+                            dir: settings.bot_dir(),
+                            release: settings.build_release,
+                            package: None,
+                        },
+                    );
+                }
+                if ui.button("Update (git pull)").clicked() {
+                    self.enqueue(
+                        "Update rust-ro-bot",
+                        JobKind::GitPull {
+                            dir: settings.bot_dir(),
+                        },
+                    );
+                }
+                if ui
+                    .add_enabled(
+                        settings.bot_built()
+                            && self.server_pid.is_some()
+                            && !self.server_stopping
+                            && self.bot_pid.is_none(),
+                        egui::Button::new("Run"),
+                    )
+                    .on_disabled_hover_text("Build the bots and start the game server first")
+                    .clicked()
+                {
+                    self.start_bots();
+                }
+            });
+        }
+        ui.separator();
+
+        // Client data -----------------------------------------------------------
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Client data · rust-ro tools").strong());
+            let ready = assets::client_data_ready(&settings);
             ui.colored_label(
                 if ready { OK } else { WARN },
-                if ready {
-                    "• ready"
-                } else {
-                    "• not prepared"
-                },
+                if ready { "• built" } else { "• not built" },
             );
         });
+        ui.label(
+            RichText::new(settings.server_client_data_dir().display().to_string())
+                .small()
+                .color(MUTED),
+        );
         ui.horizontal(|ui| {
-            if ui.button("Prepare assets").clicked() {
+            if ui.button("Build client data").clicked() {
                 if settings.assets_dir.as_os_str().is_empty() {
                     self.push_log(
                         "assets",
@@ -926,13 +1325,10 @@ impl App {
                     );
                 } else {
                     self.enqueue(
-                        "Prepare game assets",
-                        JobKind::CopyAssets {
+                        "Build client data (from the kRO assets)",
+                        JobKind::BuildClientData {
                             source: settings.assets_dir.clone(),
-                            client: settings.client_dir(),
-                            reference: settings.asset_mode == AssetMode::Reference,
-                            copy_bgm_ai: settings.copy_bgm_ai,
-                            copy_loose_data: settings.copy_loose_data,
+                            server_dir: settings.server_dir(),
                         },
                     );
                 }
@@ -947,59 +1343,45 @@ impl App {
             }
         });
 
-        // Translations ------------------------------------------------------------
+        // Translation -------------------------------------------------------------
         if settings.install_translation {
-            let layers = [
-                (
-                    "ROenglishRE (base)",
-                    settings.translation_re_dir(),
-                    settings.translation_re_source(),
-                    settings.translation_re_cloned(),
-                    settings.translation_re_applied(),
-                    settings.translation_re_marker(),
-                    "Apply English translation (ROenglishRE)",
-                ),
-                (
-                    "ROenglishPRE (overlay)",
-                    settings.translation_pre_dir(),
-                    settings.translation_pre_source(),
-                    settings.translation_pre_cloned(),
-                    settings.translation_pre_applied(),
-                    settings.translation_pre_marker(),
-                    "Apply English translation (ROenglishPRE)",
-                ),
-            ];
-            for (name, dir, source, cloned, applied, marker, label) in layers {
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("Translation · {name}")).strong());
-                    state_chip_with(ui, applied, cloned, "applied", "cloned, not applied");
-                });
-                ui.label(
-                    RichText::new(dir.display().to_string())
-                        .small()
-                        .color(MUTED),
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Translation · ROenglishRE (Pre-Renewal)").strong());
+                state_chip_with(
+                    ui,
+                    settings.translation_applied(),
+                    settings.translation_cloned(),
+                    "applied",
+                    "cloned, not applied",
                 );
-                if cloned {
-                    ui.horizontal(|ui| {
-                        if ui.button("Apply into data").clicked() {
-                            self.enqueue(
-                                label,
-                                JobKind::CopyTranslation {
-                                    source: source.clone(),
-                                    extracted: settings.client_extracted_dir(),
-                                    marker: marker.clone(),
-                                },
-                            );
-                        }
-                        if ui.button("Update (git pull)").clicked() {
-                            self.enqueue(
-                                format!("Update {name}"),
-                                JobKind::GitPull { dir: dir.clone() },
-                            );
-                        }
-                    });
-                }
+            });
+            ui.label(
+                RichText::new(settings.translation_dir().display().to_string())
+                    .small()
+                    .color(MUTED),
+            );
+            if settings.translation_cloned() {
+                ui.horizontal(|ui| {
+                    if ui.button("Apply into data").clicked() {
+                        self.enqueue(
+                            "Apply English translation (ROenglishRE, Pre-Renewal)",
+                            JobKind::CopyTranslation {
+                                sources: settings.translation_sources(),
+                                extracted: settings.client_extracted_dir(),
+                                marker: settings.translation_marker(),
+                            },
+                        );
+                    }
+                    if ui.button("Update (git pull)").clicked() {
+                        self.enqueue(
+                            "Update ROenglishRE",
+                            JobKind::GitPull {
+                                dir: settings.translation_dir(),
+                            },
+                        );
+                    }
+                });
             }
         }
     }
@@ -1013,7 +1395,12 @@ impl App {
             ui.group(|ui| {
                 ui.set_min_width(300.0);
                 ui.label(RichText::new("Game server").strong());
-                process_card_status(ui, self.server_pid, self.server_started);
+                process_card_status(
+                    ui,
+                    self.server_pid,
+                    self.server_started,
+                    self.server_stopping.then_some("Stopping…"),
+                );
                 ui.label(
                     RichText::new(format!("{}:{}", settings.server_host, settings.game_port))
                         .small()
@@ -1027,7 +1414,10 @@ impl App {
                     {
                         self.start_server();
                     }
-                    if ui.add_enabled(running, egui::Button::new("Stop")).clicked() {
+                    if ui
+                        .add_enabled(running && !self.server_stopping, egui::Button::new("Stop"))
+                        .clicked()
+                    {
                         self.stop_server();
                     }
                 });
@@ -1036,7 +1426,7 @@ impl App {
             ui.group(|ui| {
                 ui.set_min_width(300.0);
                 ui.label(RichText::new("Game client").strong());
-                process_card_status(ui, self.client_pid, self.client_started);
+                process_card_status(ui, self.client_pid, self.client_started, None);
                 ui.label(
                     RichText::new(format!(
                         "{}:{}",
@@ -1056,6 +1446,44 @@ impl App {
                     }
                     if ui.add_enabled(running, egui::Button::new("Stop")).clicked() {
                         self.stop_client();
+                    }
+                });
+            });
+
+            ui.group(|ui| {
+                ui.set_min_width(300.0);
+                ui.label(RichText::new("Bots").strong());
+                process_card_status(
+                    ui,
+                    self.bot_pid,
+                    self.bot_started,
+                    self.bots_stopping.then_some("Logging out…"),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "{} bots · Bot API port {}",
+                        settings.bot_count, settings.bot_api_port
+                    ))
+                    .small()
+                    .color(MUTED),
+                );
+                ui.horizontal(|ui| {
+                    let running = self.bot_pid.is_some();
+                    if ui
+                        .add_enabled(
+                            !running && self.server_pid.is_some() && !self.server_stopping,
+                            egui::Button::new("Start"),
+                        )
+                        .on_disabled_hover_text("The bots join a running game server")
+                        .clicked()
+                    {
+                        self.start_bots();
+                    }
+                    if ui
+                        .add_enabled(running && !self.bots_stopping, egui::Button::new("Stop"))
+                        .clicked()
+                    {
+                        self.stop_bots();
                     }
                 });
             });
@@ -1090,14 +1518,15 @@ impl App {
                 settings.client_config_json().display()
             ));
             ui.label(format!("Server config: {}", settings.server_config_json().display()));
-            ui.label("The client reads GRFs from nostalro-client/data; loose files in data/extracted override them.");
+            ui.label(format!("The client downloads its data from {}", settings.client_data_url()));
+            ui.label("nostalro-client/data/extracted holds the translation, which overrides the served data.");
         });
 
-        if !assets::is_ready(&settings) {
+        if !assets::client_data_ready(&settings) {
             ui.add_space(8.0);
             ui.colored_label(
                 WARN,
-                "Assets are not prepared yet. Open Setup, choose your kRO folder and press Prepare assets.",
+                "Client data is not built yet. Open Setup, choose your kRO folder and press Build client data.",
             );
         }
     }
@@ -1147,6 +1576,7 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_events();
+        self.stoppers.retain(|stopper| !stopper.is_finished());
         self.maybe_save_settings();
         self.drain_queue();
         self.top_bar(ctx);
@@ -1160,11 +1590,70 @@ impl Drop for App {
     fn drop(&mut self) {
         self.stop_all();
         self.runner.cancel();
+        // The bots log out and the server is killed after them: wait, or the server outlives us.
+        for stopper in self.stoppers.drain(..) {
+            let _ = stopper.join();
+        }
         self.log_files.flush();
     }
 }
 
 // -- small UI helpers ------------------------------------------------------------
+
+/// A number typed into the menu. The value is only replaced once the text parses and lies in
+/// `range`, so a half-typed or out-of-range number never reaches the settings. The text itself is
+/// kept between frames, which lets the user keep typing.
+fn number_input<T>(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    value: &mut T,
+    range: RangeInclusive<f64>,
+) -> Option<String>
+where
+    T: Copy + Display + FromStr + Into<f64> + Send + Sync + 'static,
+{
+    let mut text = ui
+        .data_mut(|data| data.get_temp::<String>(id))
+        .unwrap_or_else(|| value.to_string());
+    ui.add(egui::TextEdit::singleline(&mut text).desired_width(120.0));
+    let out_of_range = || {
+        Some(format!(
+            "must be between {} and {}",
+            range.start(),
+            range.end()
+        ))
+    };
+    let problem = match text.trim().parse::<T>() {
+        Ok(parsed) => {
+            let number: f64 = parsed.into();
+            if range.contains(&number) {
+                *value = parsed;
+                None
+            } else {
+                out_of_range()
+            }
+        }
+        // `70000` is a number too large for a port, not a typo.
+        Err(_) if text.trim().parse::<f64>().is_ok() => out_of_range(),
+        Err(_) => Some("not a number".to_string()),
+    };
+    ui.data_mut(|data| data.insert_temp(id, text));
+    problem
+}
+
+/// [`number_input`] for a settings field, showing why the text is not applied.
+fn checked_field<T>(
+    ui: &mut egui::Ui,
+    name: &'static str,
+    value: &mut T,
+    range: RangeInclusive<f64>,
+) where
+    T: Copy + Display + FromStr + Into<f64> + Send + Sync + 'static,
+{
+    if let Some(problem) = number_input(ui, egui::Id::new(name), value, range) {
+        ui.colored_label(BAD, problem);
+    }
+}
 
 fn status_line(ui: &mut egui::Ui, label: &str, ready: bool, started: bool) {
     let (glyph, color) = if ready {
@@ -1201,8 +1690,17 @@ fn state_chip_with(
     ui.colored_label(color, format!("• {text}"));
 }
 
-fn process_line(ui: &mut egui::Ui, name: &str, pid: Option<u32>, started: Option<Instant>) {
+fn process_line(
+    ui: &mut egui::Ui,
+    name: &str,
+    pid: Option<u32>,
+    started: Option<Instant>,
+    stopping: bool,
+) {
     match pid {
+        Some(pid) if stopping => {
+            ui.label(RichText::new(format!("• {name}: pid {pid} (stopping)")).color(WARN));
+        }
         Some(pid) => {
             let elapsed = started
                 .map(|instant| instant.elapsed().as_secs())
@@ -1215,8 +1713,20 @@ fn process_line(ui: &mut egui::Ui, name: &str, pid: Option<u32>, started: Option
     }
 }
 
-fn process_card_status(ui: &mut egui::Ui, pid: Option<u32>, started: Option<Instant>) {
+/// `stopping` names what a process on its way out is doing.
+fn process_card_status(
+    ui: &mut egui::Ui,
+    pid: Option<u32>,
+    started: Option<Instant>,
+    stopping: Option<&str>,
+) {
     match pid {
+        Some(pid) if stopping.is_some() => {
+            ui.colored_label(
+                WARN,
+                format!("{} · pid {pid}", stopping.unwrap_or_default()),
+            );
+        }
         Some(pid) => {
             let elapsed = started
                 .map(|instant| instant.elapsed().as_secs())
@@ -1252,6 +1762,26 @@ fn path_field_row(ui: &mut egui::Ui, label: &str, value: &mut String, browse: &m
     });
 }
 
+/// A process started by [`App::spawn_managed`].
+struct Spawned {
+    pid: u32,
+    /// Set by the process's wait thread once it exited.
+    exited: Arc<AtomicBool>,
+    stdin: Option<ChildStdin>,
+}
+
+/// Gives a process up to `grace` to exit, then kills it. `exited` comes from the process's wait
+/// thread, so a pid the system already gave to another process is not killed.
+fn wait_or_kill(pid: u32, exited: &AtomicBool, grace: Duration) {
+    let deadline = Instant::now() + grace;
+    while !exited.load(Ordering::SeqCst) && Instant::now() < deadline {
+        std::thread::sleep(SERVER_POLL_INTERVAL);
+    }
+    if !exited.load(Ordering::SeqCst) {
+        kill_pid(pid);
+    }
+}
+
 /// Process output is written to disk by the reader threads, so it is kept even while the window is not repainting.
 #[derive(Clone)]
 struct ProcessLogSink {
@@ -1285,6 +1815,45 @@ fn spawn_process_reader<R: std::io::Read + Send + 'static>(
     });
 }
 
+/// Polls the server's ports from a background thread until all of them accept connections, then
+/// reports the result for server instance `generation`.
+fn spawn_readiness_check(
+    tx: Sender<AppEvent>,
+    ctx: egui::Context,
+    generation: u64,
+    host: String,
+    ports: Vec<u16>,
+) {
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + SERVER_READY_TIMEOUT;
+        let result = loop {
+            if ports.iter().all(|&port| port_accepts(&host, port)) {
+                break Ok(());
+            }
+            if Instant::now() >= deadline {
+                let ports: Vec<String> = ports.iter().map(u16::to_string).collect();
+                break Err(format!(
+                    "game server did not accept connections on {host} ports {} within {}s",
+                    ports.join(", "),
+                    SERVER_READY_TIMEOUT.as_secs()
+                ));
+            }
+            std::thread::sleep(SERVER_POLL_INTERVAL);
+        };
+        let _ = tx.send(AppEvent::ServerReady { generation, result });
+        ctx.request_repaint();
+    });
+}
+
+fn port_accepts(host: &str, port: u16) -> bool {
+    match (host, port).to_socket_addrs() {
+        Ok(mut addrs) => {
+            addrs.any(|addr| TcpStream::connect_timeout(&addr, PORT_PROBE_TIMEOUT).is_ok())
+        }
+        Err(_) => false,
+    }
+}
+
 fn now_hhmmss() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1310,5 +1879,110 @@ fn open_path(path: &Path) {
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         let _ = Command::new("xdg-open").arg(path).spawn();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn a_process_still_running_after_its_grace_is_killed() {
+        #[cfg(windows)]
+        let mut command = Command::new("ping");
+        #[cfg(windows)]
+        command.args(["-n", "30", "127.0.0.1"]);
+        #[cfg(not(windows))]
+        let mut command = Command::new("sleep");
+        #[cfg(not(windows))]
+        command.arg("30");
+        let mut child = command.stdout(Stdio::null()).spawn().unwrap();
+
+        let started = Instant::now();
+        wait_or_kill(
+            child.id(),
+            &AtomicBool::new(false),
+            Duration::from_millis(300),
+        );
+        child.wait().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(15));
+    }
+
+    #[test]
+    fn an_exited_process_is_not_waited_for() {
+        let started = Instant::now();
+        // The pid is never looked at: the exit flag says it is gone.
+        wait_or_kill(u32::MAX, &AtomicBool::new(true), Duration::from_secs(30));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn port_probe_sees_only_ports_that_accept_connections() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let open = listener.local_addr().unwrap().port();
+        assert!(port_accepts("127.0.0.1", open));
+
+        let closed = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        assert!(!port_accepts("127.0.0.1", closed));
+    }
+
+    #[test]
+    fn readiness_check_reports_once_every_port_accepts_connections() {
+        let game = TcpListener::bind("127.0.0.1:0").unwrap();
+        let data = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ports = vec![
+            game.local_addr().unwrap().port(),
+            data.local_addr().unwrap().port(),
+        ];
+        let (tx, rx) = mpsc::channel();
+
+        spawn_readiness_check(tx, egui::Context::default(), 7, "127.0.0.1".into(), ports);
+
+        match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+            AppEvent::ServerReady { generation, result } => {
+                assert_eq!(generation, 7);
+                assert!(result.is_ok(), "{result:?}");
+            }
+            _ => panic!("expected ServerReady"),
+        }
+    }
+
+    #[test]
+    fn readiness_check_waits_for_a_port_that_is_not_open_yet() {
+        let game = TcpListener::bind("127.0.0.1:0").unwrap();
+        let game_port = game.local_addr().unwrap().port();
+        // Reserve a port for the client data endpoint, but only start listening on it later.
+        let data_port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let (tx, rx) = mpsc::channel();
+
+        spawn_readiness_check(
+            tx,
+            egui::Context::default(),
+            1,
+            "127.0.0.1".into(),
+            vec![game_port, data_port],
+        );
+        assert!(
+            rx.recv_timeout(Duration::from_millis(600)).is_err(),
+            "reported before the data port opened"
+        );
+
+        let _data = TcpListener::bind(("127.0.0.1", data_port)).unwrap();
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(10)),
+            Ok(AppEvent::ServerReady {
+                generation: 1,
+                result: Ok(())
+            })
+        ));
     }
 }

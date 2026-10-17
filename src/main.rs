@@ -10,10 +10,9 @@ mod settings;
 
 use events::AppEvent;
 use jobs::{JobKind, JobRunner};
-use settings::{AssetMode, Settings};
+use settings::Settings;
 
 use std::collections::VecDeque;
-use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 
 fn main() -> eframe::Result<()> {
@@ -65,8 +64,7 @@ fn print_usage() {
          Options:\n  \
          --install-dir <path>   Override the install folder\n  \
          --assets-dir <path>    Override the kRO assets folder (DATA.INI + GRFs)\n  \
-         --reference-assets     Reference the GRF archives in place instead of copying\n  \
-         --prepare-assets       With --generate-configs, also prepare game assets\n  \
+         --prepare-assets       With --generate-configs, also build the client data\n  \
          --force                With --setup, rebuild/recopy everything\n\n\
          Settings are loaded from and saved to ro-sppack.json in the working directory."
     );
@@ -86,9 +84,6 @@ fn apply_overrides(settings: &mut Settings, args: &[String]) {
     if let Some(value) = arg_value(args, "--assets-dir") {
         settings.assets_dir = value.into();
     }
-    if args.iter().any(|arg| arg == "--reference-assets") {
-        settings.asset_mode = AssetMode::Reference;
-    }
 }
 
 fn run_generate_configs(args: &[String]) -> Result<(), String> {
@@ -102,20 +97,13 @@ fn run_generate_configs(args: &[String]) -> Result<(), String> {
                     .into(),
             );
         }
-        let (tx, _rx) = mpsc::channel();
-        let cancel = AtomicBool::new(false);
-        let message = assets::copy_assets(
-            0,
-            &settings.assets_dir,
-            &settings.client_dir(),
-            settings.asset_mode == AssetMode::Reference,
-            settings.copy_bgm_ai,
-            settings.copy_loose_data,
-            &tx,
-            &egui::Context::default(),
-            &cancel,
-        )?;
-        println!("assets: {message}");
+        run_plan(vec![(
+            "Build client data (from the kRO assets)".into(),
+            JobKind::BuildClientData {
+                source: settings.assets_dir.clone(),
+                server_dir: settings.server_dir(),
+            },
+        )])?;
     }
 
     let message = config_gen::generate_all(&settings)?;

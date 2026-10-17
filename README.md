@@ -8,11 +8,12 @@ single folder and runs everything from one window:
 | --- | --- | --- |
 | Game server | [`pts1667/rust-ro`](https://github.com/pts1667/rust-ro) | A Rust Ragnarok Online server (login / char / map in one process) |
 | Game client | [`pts1667/nostalro-client`](https://github.com/pts1667/nostalro-client) | A native Rust client (wgpu/winit) that reads your GRF archives directly — no browser and no asset server |
-| Game assets | You | The kRO client root (`DATA.INI` + `.grf` archives), supplied during setup |
-| English translation (optional) | [`zackdreaver/ROenglishRE`](https://github.com/zackdreaver/ROenglishRE) + [`zackdreaver/ROenglishPRE`](https://github.com/zackdreaver/ROenglishPRE) | Loose data files that override the archive contents |
+| Bots | [`pts1667/rust-ro-bot`](https://github.com/pts1667/rust-ro-bot) | Characters that play on their own through the server's Bot API: they level, trade, party up and chat |
+| Game assets | You | The kRO client root (`DATA.INI` + `.grf` archives). The server reads it once to build the game data it serves on `/data` |
+| English translation (optional) | [`llchrisll/ROenglishRE`](https://github.com/llchrisll/ROenglishRE) | Loose data files (renewal base, pre-renewal overlay, old-client compatibility tables) that override the archive contents |
 
 ro-sppack is the launcher itself (a small [egui](https://github.com/emilk/egui)
-desktop app). It clones the repositories, builds them, prepares the assets,
+desktop app). It clones the repositories, builds them, builds the client data,
 writes all configuration, and starts/stops the server and client.
 
 ## Requirements
@@ -20,10 +21,10 @@ writes all configuration, and starts/stops the server and client.
 - **Windows / Linux / macOS** (the launcher and the client build on all three).
 - **Git** on `PATH`.
 - **Rust toolchain installed via [rustup](https://rustup.rs)** — the server pins
-  a nightly toolchain and the client pins a recent stable one, both in
-  `rust-toolchain.toml`. Before each build the launcher runs
+  a nightly toolchain, and the client and the bots pin the same recent stable
+  one, each in `rust-toolchain.toml`. Before each build the launcher runs
   `rustup toolchain install <pinned-channel> --profile minimal` and then builds
-  with `cargo +<pinned-channel>`, so neither toolchain needs to be your default.
+  with `cargo +<pinned-channel>`, so none of them needs to be your default.
 - A **Ragnarok Online client folder** (kRO or compatible) containing
   `DATA.INI` and the `.grf` archives. ro-sppack never downloads game assets;
   they are copyrighted by Gravity Co., Ltd.
@@ -43,47 +44,72 @@ writes all configuration, and starts/stops the server and client.
    ```
    Clone rust-ro server
    Clone nostalro client
+   Clone rust-ro-bot
    Clone English translation (ROenglishRE)     (optional, on by default)
-   Clone English translation (ROenglishPRE)    (optional, on by default)
    Build rust-ro server                        (cargo build --release)
    Build nostalro client                       (cargo build --release -p ragnarok-client)
-   Prepare game assets                         (copy/reference GRFs, loose data)
-   Apply English translation (ROenglishRE)
-   Apply English translation (ROenglishPRE)
+   Build rust-ro-bot                           (cargo build --release)
+   Build client data                           (rust-ro client-data-setup, from the GRFs)
+   Apply English translation (ROenglishRE, Pre-Renewal)
    Generate configuration
    ```
 3. When **PLAY** lights up, press it. The launcher:
    - regenerates the server configuration and patches the client `config.json`,
    - starts `rust-ro` (game server, default port `6901`),
-   - starts the native client, which connects to the login server.
+   - starts the native client, which connects to the login server,
+   - starts 50 bots once the server accepts connections (see [Bots](#bots)).
 
 Log in with the seeded account **`admin` / `qwertz`** (account id `2000000`).
 That account is handled entirely by rust-ro; other accounts would be proxied
 to a separate rAthena/Hercules installation and are not available in this
 standalone package.
 
+## Bots
+
+With **Bots: start with the server** ticked (the default), the launcher starts
+`rust-ro-bot run --bots 50 --server-dir <install>/rust-ro --stop-on-stdin` as
+soon as the server's game, client data, reference and Bot API ports accept
+connections. With `--server-dir`, the bots take the Bot API and reference
+addresses and the API key from the server's `config.json`, so they follow
+whatever the launcher wrote there. The bots use their default voice, the
+decision model at `127.0.0.1:9931`; when it does not answer, they play by the
+rules alone and don't chat.
+
+- **Stopping logs the bots out cleanly.** The launcher sends them `stop` on
+  their stdin: each finishes its step, saves its memory and leaves the game.
+  Bots still running after 60 seconds are killed. If the launcher itself dies,
+  the pipe closes and the bots stop the same way.
+- Stopping the server (or **Stop All**, or closing the window) logs the bots out
+  first and kills the server only after they are gone, so they can still say
+  bye. Closing the window can therefore take up to a minute while bots run.
+- A run that was killed anyway leaves no characters behind for long: the next
+  run logs out the resting characters of its pool that are still in the game.
+- The server config gets `bots.max_bots` and `bots.max_registered_bots` of at
+  least twice the bot count: the characters take turns with a pool of twice the
+  bots, and every one of them must be registered.
+- The **Bots** card in the Dashboard and the **Run** button in Setup start and
+  stop them by hand while the server runs.
+- Their output goes to the Logs tab and `logs/bots.log`.
+
 ## Folder layout
 
 ```
 <install folder>/
   rust-ro/                    cloned server repository (config.json is regenerated)
+    config/client-data/       game data the server serves on /data (built from the kRO archives)
   nostalro-client/            cloned native client repository
-    config.json               managed connection/resource fields + your in-game settings
+  rust-ro-bot/                cloned bot repository (state/ and cache/ hold the bots' memory and the reference cache)
+    config.json               managed connection/data fields + your in-game settings
     data/
-      *.grf                   copied archives (none in "reference" mode)
-      ro-sppack-assets.json   archive manifest written into config.json
-      extracted/              loose overrides; checked before the archives
-      BGM/                    only when "copy BGM" is enabled
-  ROenglishRE/                optional English translation (base, `Ragnarok/` subfolder)
-  ROenglishPRE/               optional English translation (pre-renewal overlay)
-  translation-re.json         marker written after ROenglishRE is applied
-  translation-pre.json        marker written after ROenglishPRE is applied
+      extracted/              English translation; checked before the served data
+  ROenglishRE/                optional English translation clone
+  translation.json            marker written after the translation is applied
   ro-sppack.json              launcher settings (working directory)
 ```
 
-The client resolves files by priority: `data/extracted/` first, then every
-archive in `grf_paths` in order, so a translation or loose override wins
-without repacking a `.grf`.
+The client resolves files by priority: `data/extracted/` first, then the
+server's `/data` endpoint (`data_url`), so a translation wins without
+repacking anything. No archives are copied into the client.
 
 ## Command line
 
@@ -112,32 +138,51 @@ ro-sppack.exe --setup > setup.log 2>&1
 - `server.enable_websocket = true`, `server.enable_legacy_proxy = false`,
 - `server.packetver` (default `20120307`),
 - the seeded account `2000000` appended to `server.accounts`,
-- `game.*` rates (base/job EXP, drop, card drop, mob density).
+- `game.*` rates (base/job EXP, drop, card drop, MVP drop, mob density),
+- `client_data` (the `/data` endpoint: port 6903 by default, bound to the bind host),
+- `bots` (the bot API: enabled flag and port 6902 by default; with the API
+  on, `max_bots` and `max_registered_bots` of at least twice the bot count),
+- `reference` (`/db` and `/wiki`, which the bots plan with: enabled, port 6904 by default).
 
 **`nostalro-client/config.json`** — the launcher only patches the fields it
 owns and preserves everything else the client wrote (window state, keybindings,
 volumes, graphic options):
 
 - `packetver`, `login_servers[0]` (host/port from your settings),
-- `grf_paths` — `data/<name>.grf` entries in copy mode, absolute paths in
-  reference mode,
-- `data_dir = data/extracted` when loose overrides were prepared,
-- `bgm_path` — `data/BGM` when copied, otherwise the assets folder's `BGM/`
-  by absolute path.
+- `data_url` — the server's `/data` endpoint, built from the advertised host
+  and the client data port,
+- `grf_paths` — cleared: the client gets everything from `data_url`,
+- `data_dir = data/extracted` when the translation was applied,
+- `bgm_path` — removed, so BGM tracks are read from `bgm/` on `data_url`.
 
 ## Notes
 
-- **Archive copy vs reference.** Copying is the default and makes the install
-  self-contained. If you are short on disk space, switch "Reference archives in
-  place": no GRFs are copied and `grf_paths` gets absolute paths instead.
+- **Client data.** *Build client data* runs rust-ro's `client-data-setup` over
+  your kRO folder (the archives listed in `DATA.INI`, or every `.grf`). It
+  writes `rust-ro/config/client-data`, which the server publishes on the client
+  data port. Build it once; *Rebuild Everything* builds it again.
+- **Menu changes.** Every value in the Setup tab is checked before it is used:
+  rates accept 0.0 to 10000.0, mob density 0.0 to 10.0, and ports 1 to 65535
+  (the game, client data, reference and bot ports must differ). A value that is not valid
+  is not applied. Valid values are written to both configuration files at once;
+  a running server reads its configuration only at start, so restart it to
+  apply the change.
 - **English translation.** On English systems the setup enables the fan
-  translation by default: [ROenglishRE](https://github.com/zackdreaver/ROenglishRE)
-  (base) is cloned and copied into `data/extracted/`, then
-  [ROenglishPRE](https://github.com/zackdreaver/ROenglishPRE) is cloned and copied
-  on top of it, so the pre-renewal files win where the two overlap. Most of the
-  content is Lua table (`.lub`) and item/skill/message `.txt` files — no archive
-  repacking is needed. Turn it off with *Install the English translation* in
-  Setup, or re-apply after an update with **Apply into data**.
+  translation by default: [llchrisll/ROenglishRE](https://github.com/llchrisll/ROenglishRE)
+  is cloned and layered into `data/extracted/`, with later layers overwriting
+  earlier ones:
+  1. `Translation/Renewal` — the renewal base (message table, interface
+     textures, Lua tables),
+  2. `Translation/Pre-Renewal` — pre-renewal skills, maps and Lua files,
+  3. `Translation/Compatibility/2012-04-10/Pre-Renewal` — the classic
+     `*item*table.txt` files that a 2012-era client reads for item names,
+     descriptions and slots.
+
+  This mirrors what the project's `Tools/ClientGenerator.bat` produces for
+  *Pre-Renewal* and is what the native client expects; most content is Lua
+  table (`.lub`) and item/skill/message `.txt` files, so no archive repacking
+  is needed. Turn it off with *Install the English translation* in Setup, or
+  re-apply after an update with **Apply into data**.
 - **LAN play.** Set *Bind host* to `0.0.0.0` and *Advertised host* to your
   machine's LAN IP, then open the game port in your firewall. Every player
   needs their own copy of the client configured with your IP as the login
@@ -147,7 +192,7 @@ volumes, graphic options):
   rebuild afterwards with the per-component **Build** buttons or
   **Rebuild Everything**.
 - **Rebuilds.** `Install Everything` only fills in missing pieces.
-  *Rebuild Everything* forces every build and re-copies assets.
+  *Rebuild Everything* forces every build and rebuilds the client data.
 - **Settings file.** Install and assets paths (plus every other option) are
   remembered in `ro-sppack.json` in the current working directory, rewritten
   whenever something changes. If no file is there yet, a settings file left

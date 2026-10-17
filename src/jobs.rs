@@ -20,6 +20,12 @@ pub enum JobKind {
         url: String,
         dest: PathBuf,
     },
+    /// Clone `url` into `dest`, or repoint an existing clone that came from a
+    /// different repository. Used for the translation, whose source changed.
+    GitSync {
+        url: String,
+        dest: PathBuf,
+    },
     GitPull {
         dir: PathBuf,
     },
@@ -29,15 +35,14 @@ pub enum JobKind {
         /// Optional `-p <package>` for workspace repositories.
         package: Option<String>,
     },
-    CopyAssets {
+    /// Run rust-ro's `client-data-setup` over a kRO client folder, writing the tree the server
+    /// serves under `/data`.
+    BuildClientData {
         source: PathBuf,
-        client: PathBuf,
-        reference: bool,
-        copy_bgm_ai: bool,
-        copy_loose_data: bool,
+        server_dir: PathBuf,
     },
     CopyTranslation {
-        source: PathBuf,
+        sources: Vec<PathBuf>,
         extracted: PathBuf,
         marker: PathBuf,
     },
@@ -155,6 +160,151 @@ fn run_job(
             )
         }
 
+        JobKind::GitSync { url, dest } => {
+            if !dest.join(".git").is_dir() {
+                if dest.exists() {
+                    return Err(format!(
+                        "{} already exists but is not a git clone; move it away so the repository can be cloned",
+                        dest.display()
+                    ));
+                }
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("create {}: {e}", parent.display()))?;
+                }
+                return run_program(
+                    job.id,
+                    "git",
+                    &[
+                        "clone".into(),
+                        "--depth".into(),
+                        "1".into(),
+                        url.clone(),
+                        dest.display().to_string(),
+                    ],
+                    Path::new("."),
+                    &[],
+                    tx,
+                    ctx,
+                    cancel,
+                    pid_slot,
+                );
+            }
+            // An existing clone of a different repository (e.g. the old two
+            // zackdreaver translations): point it at the requested one and
+            // check the fetched revision out, local changes included.
+            let _ = tx.send(AppEvent::JobLog {
+                id: job.id,
+                line: format!(
+                    "existing clone at {}; repointing it at {url}",
+                    dest.display()
+                ),
+            });
+            ctx.request_repaint();
+            if run_program(
+                job.id,
+                "git",
+                &[
+                    "remote".into(),
+                    "set-url".into(),
+                    "origin".into(),
+                    url.clone(),
+                ],
+                dest,
+                &[],
+                tx,
+                ctx,
+                cancel,
+                pid_slot,
+            )
+            .is_err()
+            {
+                run_program(
+                    job.id,
+                    "git",
+                    &["remote".into(), "add".into(), "origin".into(), url.clone()],
+                    dest,
+                    &[],
+                    tx,
+                    ctx,
+                    cancel,
+                    pid_slot,
+                )?;
+            }
+            // Fetch into the remote-tracking branch so `git pull` keeps working
+            // after the repository was repointed.
+            let fetched = run_program(
+                job.id,
+                "git",
+                &[
+                    "fetch".into(),
+                    "--depth".into(),
+                    "1".into(),
+                    "origin".into(),
+                    "+master:refs/remotes/origin/master".into(),
+                ],
+                dest,
+                &[],
+                tx,
+                ctx,
+                cancel,
+                pid_slot,
+            );
+            if fetched.is_err() {
+                run_program(
+                    job.id,
+                    "git",
+                    &[
+                        "fetch".into(),
+                        "--depth".into(),
+                        "1".into(),
+                        "origin".into(),
+                        "+main:refs/remotes/origin/main".into(),
+                    ],
+                    dest,
+                    &[],
+                    tx,
+                    ctx,
+                    cancel,
+                    pid_slot,
+                )?;
+            }
+            run_program(
+                job.id,
+                "git",
+                &[
+                    "checkout".into(),
+                    "-f".into(),
+                    "-B".into(),
+                    "master".into(),
+                    "FETCH_HEAD".into(),
+                ],
+                dest,
+                &[],
+                tx,
+                ctx,
+                cancel,
+                pid_slot,
+            )?;
+            // Best effort: make sure the branch tracks the new remote.
+            let _ = run_program(
+                job.id,
+                "git",
+                &[
+                    "branch".into(),
+                    "--set-upstream-to=origin/master".into(),
+                    "master".into(),
+                ],
+                dest,
+                &[],
+                tx,
+                ctx,
+                cancel,
+                pid_slot,
+            );
+            Ok(format!("repointed {} at {url}", dest.display()))
+        }
+
         JobKind::GitPull { dir } => run_program(
             job.id,
             "git",
@@ -172,49 +322,7 @@ fn run_job(
             release,
             package,
         } => {
-            // rust-ro pins a nightly toolchain in rust-toolchain.toml. Install it
-            // explicitly (a no-op when present) and build with it, instead of
-            // relying on the default toolchain being nightly.
-            let channel = read_toolchain_channel(dir);
-            let mut cargo_args: Vec<String> = Vec::new();
-            if let Some(channel) = &channel
-                && rustup_available()
-            {
-                let _ = tx.send(AppEvent::JobLog {
-                    id: job.id,
-                    line: format!("ensuring pinned toolchain `{channel}` is installed"),
-                });
-                ctx.request_repaint();
-                match run_program(
-                    job.id,
-                    "rustup",
-                    &[
-                        "toolchain".into(),
-                        "install".into(),
-                        channel.clone(),
-                        "--profile".into(),
-                        "minimal".into(),
-                    ],
-                    dir,
-                    &[],
-                    tx,
-                    ctx,
-                    cancel,
-                    pid_slot,
-                ) {
-                    Ok(_) => {}
-                    Err(error) => {
-                        let _ = tx.send(AppEvent::JobLog {
-                                id: job.id,
-                                line: format!(
-                                    "rustup could not prepare `{channel}` ({error}); cargo will try again"
-                                ),
-                            });
-                        ctx.request_repaint();
-                    }
-                }
-                cargo_args.push(format!("+{channel}"));
-            }
+            let mut cargo_args = pinned_toolchain(job.id, dir, tx, ctx, cancel, pid_slot);
             cargo_args.push("build".into());
             if *release {
                 cargo_args.push("--release".into());
@@ -236,39 +344,67 @@ fn run_job(
             )
         }
 
-        JobKind::CopyAssets {
-            source,
-            client,
-            reference,
-            copy_bgm_ai,
-            copy_loose_data,
-        } => {
-            let message = assets::copy_assets(
+        JobKind::BuildClientData { source, server_dir } => {
+            if !server_dir.join("Cargo.toml").is_file() {
+                return Err(format!(
+                    "rust-ro is not cloned at {}; install it first",
+                    server_dir.display()
+                ));
+            }
+            let archives = assets::collect_grfs(source)?;
+            if archives.is_empty() {
+                return Err(format!("no .grf archives in {}", source.display()));
+            }
+            // The tool runs from the server folder, so `--out` lands in the root the
+            // server publishes (`client_data.root` in its config).
+            let mut cargo_args = pinned_toolchain(job.id, server_dir, tx, ctx, cancel, pid_slot);
+            cargo_args.extend(
+                [
+                    "run",
+                    "--release",
+                    "--package",
+                    "tools",
+                    "--bin",
+                    "client-data-setup",
+                    "--",
+                    "--client",
+                ]
+                .map(String::from),
+            );
+            cargo_args.push(source.display().to_string());
+            cargo_args.extend(["--out".into(), "config/client-data".into()]);
+            for archive in archives {
+                cargo_args.push("--archive".into());
+                cargo_args.push(archive.display().to_string());
+            }
+            let message = run_program(
                 job.id,
-                source,
-                client,
-                *reference,
-                *copy_bgm_ai,
-                *copy_loose_data,
+                "cargo",
+                &cargo_args,
+                server_dir,
+                &[],
                 tx,
                 ctx,
                 cancel,
+                pid_slot,
             )?;
-            let _ = tx.send(AppEvent::JobLog {
-                id: job.id,
-                line: message.clone(),
-            });
-            ctx.request_repaint();
-            Ok(message)
+            Ok(format!("client data built: {message}"))
         }
 
         JobKind::CopyTranslation {
-            source,
+            sources,
             extracted,
             marker,
         } => {
             let message =
-                assets::copy_translation(job.id, source, extracted, marker, tx, ctx, cancel)?;
+                assets::copy_translation(job.id, sources, extracted, marker, tx, ctx, cancel)?;
+            // Best effort: drop markers left by the old two-repository layout.
+            for old in [
+                marker.with_file_name("translation-re.json"),
+                marker.with_file_name("translation-pre.json"),
+            ] {
+                let _ = std::fs::remove_file(old);
+            }
             let _ = tx.send(AppEvent::JobLog {
                 id: job.id,
                 line: message.clone(),
@@ -410,6 +546,55 @@ fn rustup_available() -> bool {
     })
 }
 
+/// The `+<channel>` argument for the toolchain pinned by `dir`, or nothing when there is no pin or
+/// rustup is missing. rust-ro and the client pin their toolchain in rust-toolchain.toml, so it is
+/// installed explicitly (a no-op when present) and used instead of the default toolchain.
+fn pinned_toolchain(
+    id: u64,
+    dir: &Path,
+    tx: &Sender<AppEvent>,
+    ctx: &egui::Context,
+    cancel: &AtomicBool,
+    pid_slot: &AtomicU32,
+) -> Vec<String> {
+    let Some(channel) = read_toolchain_channel(dir) else {
+        return Vec::new();
+    };
+    if !rustup_available() {
+        return Vec::new();
+    }
+    let _ = tx.send(AppEvent::JobLog {
+        id,
+        line: format!("ensuring pinned toolchain `{channel}` is installed"),
+    });
+    ctx.request_repaint();
+    let installed = run_program(
+        id,
+        "rustup",
+        &[
+            "toolchain".into(),
+            "install".into(),
+            channel.clone(),
+            "--profile".into(),
+            "minimal".into(),
+        ],
+        dir,
+        &[],
+        tx,
+        ctx,
+        cancel,
+        pid_slot,
+    );
+    if let Err(error) = installed {
+        let _ = tx.send(AppEvent::JobLog {
+            id,
+            line: format!("rustup could not prepare `{channel}` ({error}); cargo will try again"),
+        });
+        ctx.request_repaint();
+    }
+    vec![format!("+{channel}")]
+}
+
 /// Compute the sequential setup plan. `force` rebuilds even when an artifact
 /// already exists; otherwise only missing pieces are queued.
 pub fn install_plan(settings: &Settings, force: bool) -> Vec<(String, JobKind)> {
@@ -437,28 +622,28 @@ pub fn install_plan(settings: &Settings, force: bool) -> Vec<(String, JobKind)> 
         ));
         have_client = true;
     }
+    let mut have_bot = settings.bot_cloned();
+    if !have_bot {
+        plan.push((
+            "Clone rust-ro-bot".to_string(),
+            JobKind::GitClone {
+                url: settings.bot_repo.clone(),
+                dest: settings.bot_dir(),
+            },
+        ));
+        have_bot = true;
+    }
 
-    let mut have_translation_re = settings.translation_re_cloned();
-    if settings.install_translation && !have_translation_re {
+    let mut have_translation = settings.translation_cloned();
+    if settings.install_translation && !have_translation {
         plan.push((
             "Clone English translation (ROenglishRE)".to_string(),
-            JobKind::GitClone {
-                url: settings.translation_re_repo.clone(),
-                dest: settings.translation_re_dir(),
+            JobKind::GitSync {
+                url: settings.translation_repo.clone(),
+                dest: settings.translation_dir(),
             },
         ));
-        have_translation_re = true;
-    }
-    let mut have_translation_pre = settings.translation_pre_cloned();
-    if settings.install_translation && !have_translation_pre {
-        plan.push((
-            "Clone English translation (ROenglishPRE)".to_string(),
-            JobKind::GitClone {
-                url: settings.translation_pre_repo.clone(),
-                dest: settings.translation_pre_dir(),
-            },
-        ));
-        have_translation_pre = true;
+        have_translation = true;
     }
 
     if have_server && (force || !settings.server_built()) {
@@ -481,43 +666,41 @@ pub fn install_plan(settings: &Settings, force: bool) -> Vec<(String, JobKind)> 
             },
         ));
     }
-    if !settings.assets_dir.as_os_str().is_empty() && (force || !assets::is_ready(settings)) {
+    if have_bot && (force || !settings.bot_built()) {
         plan.push((
-            "Prepare game assets".to_string(),
-            JobKind::CopyAssets {
+            "Build rust-ro-bot".to_string(),
+            JobKind::CargoBuild {
+                dir: settings.bot_dir(),
+                release: settings.build_release,
+                package: None,
+            },
+        ));
+    }
+    if have_server
+        && !settings.assets_dir.as_os_str().is_empty()
+        && (force || !assets::client_data_ready(settings))
+    {
+        plan.push((
+            "Build client data (from the kRO assets)".to_string(),
+            JobKind::BuildClientData {
                 source: settings.assets_dir.clone(),
-                client: settings.client_dir(),
-                reference: settings.asset_mode == crate::settings::AssetMode::Reference,
-                copy_bgm_ai: settings.copy_bgm_ai,
-                copy_loose_data: settings.copy_loose_data,
+                server_dir: settings.server_dir(),
             },
         ));
     }
-    // ROenglishRE is the base translation; ROenglishPRE is layered on top so
-    // its pre-renewal files win wherever the two overlap. Order matters.
+    // The translation is layered inside the client's data folder: renewal
+    // base, then pre-renewal, then the 2012-era compatibility tables. The
+    // order matters, so it is one job.
     if settings.install_translation
-        && have_translation_re
-        && (force || !settings.translation_re_applied())
+        && have_translation
+        && (force || !settings.translation_applied())
     {
         plan.push((
-            "Apply English translation (ROenglishRE)".to_string(),
+            "Apply English translation (ROenglishRE, Pre-Renewal)".to_string(),
             JobKind::CopyTranslation {
-                source: settings.translation_re_source(),
+                sources: settings.translation_sources(),
                 extracted: settings.client_extracted_dir(),
-                marker: settings.translation_re_marker(),
-            },
-        ));
-    }
-    if settings.install_translation
-        && have_translation_pre
-        && (force || !settings.translation_pre_applied())
-    {
-        plan.push((
-            "Apply English translation (ROenglishPRE)".to_string(),
-            JobKind::CopyTranslation {
-                source: settings.translation_pre_source(),
-                extracted: settings.client_extracted_dir(),
-                marker: settings.translation_pre_marker(),
+                marker: settings.translation_marker(),
             },
         ));
     }
@@ -592,31 +775,53 @@ mod tests {
     }
 
     #[test]
-    fn install_plan_layers_translations_re_then_pre() {
+    fn install_plan_queues_one_translation_clone_and_apply() {
         let mut settings = Settings::default();
         assert_eq!(
-            settings.translation_re_repo,
-            "https://github.com/zackdreaver/ROenglishRE.git"
-        );
-        assert_eq!(
-            settings.translation_pre_repo,
-            "https://github.com/zackdreaver/ROenglishPRE.git"
+            settings.translation_repo,
+            "https://github.com/llchrisll/ROenglishRE.git"
         );
 
         settings.install_translation = true;
-        let labels: Vec<String> = install_plan(&settings, false)
+        let plan = install_plan(&settings, false);
+        let labels: Vec<String> = plan.iter().map(|(label, _)| label.clone()).collect();
+        assert_eq!(
+            labels
+                .iter()
+                .filter(|label| label.starts_with("Clone English"))
+                .count(),
+            1
+        );
+        let clone = labels
+            .iter()
+            .position(|label| label == "Clone English translation (ROenglishRE)")
+            .expect("the translation should be cloned");
+        assert!(
+            plan.iter().any(
+                |(label, kind)| label == "Clone English translation (ROenglishRE)"
+                    && matches!(kind, JobKind::GitSync { .. })
+            ),
+            "legacy clones must be repointed rather than skipped"
+        );
+        let apply = labels
+            .iter()
+            .position(|label| label == "Apply English translation (ROenglishRE, Pre-Renewal)")
+            .expect("the translation should be applied");
+        assert!(clone < apply, "the clone must come before the apply");
+        // All three layers are copied by that single job.
+        let (_, kind) = plan
             .into_iter()
-            .map(|(label, _)| label)
-            .collect();
-        let re = labels
-            .iter()
-            .position(|label| label == "Apply English translation (ROenglishRE)")
-            .expect("ROenglishRE should be applied");
-        let pre = labels
-            .iter()
-            .position(|label| label == "Apply English translation (ROenglishPRE)")
-            .expect("ROenglishPRE should be applied");
-        assert!(re < pre, "ROenglishRE must be applied before ROenglishPRE");
+            .find(|(label, _)| label.starts_with("Apply English"))
+            .unwrap();
+        match kind {
+            JobKind::CopyTranslation { sources, .. } => {
+                assert_eq!(sources.len(), 3);
+                assert!(sources[0].ends_with("Translation/Renewal"));
+                assert!(sources[1].ends_with("Translation/Pre-Renewal"));
+                assert!(sources[2].ends_with("Translation/Compatibility/2012-04-10/Pre-Renewal"));
+            }
+            other => panic!("unexpected job: {other:?}"),
+        }
 
         settings.install_translation = false;
         let labels: Vec<String> = install_plan(&settings, false)
@@ -633,6 +838,47 @@ mod tests {
                 .iter()
                 .any(|label| label.starts_with("Apply English"))
         );
+    }
+
+    #[test]
+    fn install_plan_builds_client_data_only_while_it_is_missing() {
+        let install = std::env::temp_dir().join(format!(
+            "ro-sppack-plan-client-data-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let server = install.join("rust-ro");
+        std::fs::create_dir_all(&server).unwrap();
+        std::fs::write(server.join("Cargo.toml"), "[package]\n").unwrap();
+        let assets = install.join("kro");
+        std::fs::create_dir_all(&assets).unwrap();
+        let settings = Settings {
+            install_dir: install.clone(),
+            assets_dir: assets.clone(),
+            install_translation: false,
+            ..Settings::default()
+        };
+        let builds = |settings: &Settings| {
+            install_plan(settings, false)
+                .into_iter()
+                .filter_map(|(_, kind)| match kind {
+                    JobKind::BuildClientData { source, server_dir } => Some((source, server_dir)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(builds(&settings), vec![(assets.clone(), server.clone())]);
+
+        let tree = settings.server_client_data_dir();
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("manifest.json"), "{}").unwrap();
+        std::fs::write(tree.join("check.jsonl"), "").unwrap();
+        assert!(builds(&settings).is_empty());
+
+        std::fs::remove_dir_all(&install).ok();
     }
 
     /// Requires git and cargo to be installed. Run with:

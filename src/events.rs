@@ -32,4 +32,9 @@ pub enum AppEvent {
         name: String,
         code: Option<i32>,
     },
+    /// The game server (instance `generation`) accepts connections, or the wait for it gave up.
+    ServerReady {
+        generation: u64,
+        result: Result<(), String>,
+    },
 }

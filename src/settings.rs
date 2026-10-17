@@ -1,17 +1,20 @@
 //! Persisted launcher settings and the paths derived from them.
 
 use serde::{Deserialize, Serialize};
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
-/// Where game archives come from when the package is prepared.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum AssetMode {
-    /// Copy the GRF archives into `<install>/nostalro-client/data/`.
-    #[default]
-    Copy,
-    /// Leave the archives where they are and reference them by absolute path.
-    Reference,
-}
+/// Accepted range for every experience and drop rate (a multiplier, `1.0` is the default).
+pub const RATE_RANGE: RangeInclusive<f64> = 0.0..=10000.0;
+/// Accepted range for mob density, the number of mobs per spawn point.
+pub const MOB_DENSITY_RANGE: RangeInclusive<f64> = 0.0..=10.0;
+/// Accepted range for the packet version, written as `YYYYMMDD`.
+pub const PACKETVER_RANGE: RangeInclusive<f64> = 1.0..=99_999_999.0;
+/// Accepted range for every TCP port.
+pub const PORT_RANGE: RangeInclusive<f64> = 1.0..=65535.0;
+/// Accepted range for the bots playing at once. Each takes turns with a resting character, and
+/// rust-ro-bot's `names.txt` holds 640 names.
+pub const BOT_COUNT_RANGE: RangeInclusive<f64> = 1.0..=300.0;
 
 /// Settings are stored in `ro-sppack.json` in the current working directory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,24 +33,33 @@ pub struct Settings {
     pub job_exp_rate: f32,
     pub drop_rate: f32,
     pub drop_rate_card: f32,
+    pub drop_rate_mvp: f32,
     pub mob_density: f32,
+
+    /// Port of the server's client data endpoint (`/data`), the client's `data_url`.
+    pub client_data_port: u16,
+    /// Bot API (`/bots`), which lets an external program play characters.
+    pub bot_api_enabled: bool,
+    pub bot_api_port: u16,
+    /// Port of the server's read-only reference (`/db`, `/wiki`), which the bots plan with.
+    pub reference_port: u16,
+    /// Start rust-ro-bot once the server accepts connections.
+    pub launch_bots: bool,
+    /// Bots playing at once (`--bots`).
+    pub bot_count: u32,
 
     pub build_release: bool,
     /// Start the game server with `--debug-log` (script failure diagnostics).
     pub debug_log: bool,
 
-    pub asset_mode: AssetMode,
-    pub copy_loose_data: bool,
-    pub copy_bgm_ai: bool,
-
     pub server_repo: String,
     pub client_repo: String,
+    pub bot_repo: String,
 
-    /// Copy the ROenglishRE base translation and the ROenglishPRE overlay over
-    /// the client's loose data files.
+    /// Copy the ROenglishRE translation (renewal base, pre-renewal overlay and
+    /// the classic client compatibility tables) over the client's loose data.
     pub install_translation: bool,
-    pub translation_re_repo: String,
-    pub translation_pre_repo: String,
+    pub translation_repo: String,
 }
 
 impl Default for Settings {
@@ -63,17 +75,21 @@ impl Default for Settings {
             job_exp_rate: 1.0,
             drop_rate: 1.0,
             drop_rate_card: 1.0,
+            drop_rate_mvp: 1.0,
             mob_density: 1.0,
+            client_data_port: 6903,
+            bot_api_enabled: true,
+            bot_api_port: 6902,
+            reference_port: 6904,
+            launch_bots: true,
+            bot_count: 50,
             build_release: true,
             debug_log: false,
-            asset_mode: AssetMode::Copy,
-            copy_loose_data: true,
-            copy_bgm_ai: false,
             server_repo: "https://github.com/pts1667/rust-ro.git".into(),
             client_repo: default_client_repo(),
+            bot_repo: "https://github.com/pts1667/rust-ro-bot.git".into(),
             install_translation: system_language_is_english(),
-            translation_re_repo: "https://github.com/zackdreaver/ROenglishRE.git".into(),
-            translation_pre_repo: "https://github.com/zackdreaver/ROenglishPRE.git".into(),
+            translation_repo: default_translation_repo(),
         }
     }
 }
@@ -113,6 +129,14 @@ impl Settings {
         if self.client_repo.trim().is_empty() || self.client_repo.contains("roBrowserLegacy") {
             self.client_repo = default_client_repo();
         }
+        // The translation moved from the two zackdreaver repositories (renewal
+        // base + pre-renewal overlay) to llchrisll/ROenglishRE, which ships the
+        // renewal base, the pre-renewal files and old-client compatibility
+        // tables in one clone.
+        if self.translation_repo.trim().is_empty() || self.translation_repo.contains("zackdreaver")
+        {
+            self.translation_repo = default_translation_repo();
+        }
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -139,24 +163,49 @@ impl Settings {
         self.install_dir.join("nostalro-client")
     }
 
-    /// GRF archives and loose client data used by the native client.
+    pub fn bot_dir(&self) -> PathBuf {
+        self.install_dir.join("rust-ro-bot")
+    }
+
+    pub fn bot_bin(&self) -> PathBuf {
+        self.bot_dir()
+            .join("target")
+            .join(self.profile())
+            .join(format!("rust-ro-bot{}", std::env::consts::EXE_SUFFIX))
+    }
+
+    /// The Bot API key, which the server writes on its first start (`bots.api_key_path`).
+    pub fn bot_api_key_file(&self) -> PathBuf {
+        self.server_dir().join("config").join("bots_api_key.txt")
+    }
+
+    /// `rust-ro-bot run` with its defaults (the decision model as the bots' voice, characters taking
+    /// turns). `--server-dir` reads the Bot API and reference addresses and the API key from the
+    /// server's config.json; `--stop-on-stdin` lets the launcher log them out with a line `stop`.
+    pub fn bot_args(&self) -> Vec<String> {
+        vec![
+            "run".into(),
+            "--bots".into(),
+            self.bot_count.to_string(),
+            "--server-dir".into(),
+            self.server_dir().display().to_string(),
+            "--stop-on-stdin".into(),
+        ]
+    }
+
+    /// Loose translation files the client reads before the server's data (the client's `data/`).
     pub fn client_data_dir(&self) -> PathBuf {
         self.client_dir().join("data")
     }
 
-    /// Loose files that override archive entries (`data_dir` in config.json).
+    /// Loose files that override the server's client data (`data_dir` in config.json).
     pub fn client_extracted_dir(&self) -> PathBuf {
         self.client_data_dir().join("extracted")
     }
 
-    /// BGM copied into the package when "copy BGM" is enabled.
-    pub fn client_bgm_dir(&self) -> PathBuf {
-        self.client_data_dir().join("BGM")
-    }
-
-    /// Manifest of the archive paths written into the client configuration.
-    pub fn client_assets_manifest(&self) -> PathBuf {
-        self.client_data_dir().join("ro-sppack-assets.json")
+    /// The tree the server publishes under `/data`, built by `client-data-setup` in rust-ro.
+    pub fn server_client_data_dir(&self) -> PathBuf {
+        self.server_dir().join("config").join("client-data")
     }
 
     /// `config.json` of the native client (it also writes its settings there).
@@ -171,31 +220,29 @@ impl Settings {
             .join(format!("ragnarok-client{}", std::env::consts::EXE_SUFFIX))
     }
 
-    pub fn translation_re_dir(&self) -> PathBuf {
+    pub fn translation_dir(&self) -> PathBuf {
         self.install_dir.join("ROenglishRE")
     }
 
-    pub fn translation_pre_dir(&self) -> PathBuf {
-        self.install_dir.join("ROenglishPRE")
+    /// Layer roots inside the clone, applied in this order. The pre-renewal
+    /// files overwrite the renewal base, and the 2012-04-10 compatibility
+    /// files (the classic `*item*table.txt` files a 2012-era client reads)
+    /// win last. Mirrors `Tools/ClientGenerator.bat` for Pre-Renewal.
+    pub fn translation_sources(&self) -> Vec<PathBuf> {
+        const LAYERS: [&str; 3] = [
+            "Translation/Renewal",
+            "Translation/Pre-Renewal",
+            "Translation/Compatibility/2012-04-10/Pre-Renewal",
+        ];
+        LAYERS
+            .iter()
+            .map(|layer| self.translation_dir().join(layer))
+            .collect()
     }
 
-    /// Directory that holds the ROenglishRE client files (`Ragnarok/data`, ...).
-    pub fn translation_re_source(&self) -> PathBuf {
-        self.translation_re_dir().join("Ragnarok")
-    }
-
-    /// Directory that holds the ROenglishPRE client files (`data`, `System`).
-    pub fn translation_pre_source(&self) -> PathBuf {
-        self.translation_pre_dir()
-    }
-
-    /// Marker written once a translation has been copied into the client data.
-    pub fn translation_re_marker(&self) -> PathBuf {
-        self.install_dir.join("translation-re.json")
-    }
-
-    pub fn translation_pre_marker(&self) -> PathBuf {
-        self.install_dir.join("translation-pre.json")
+    /// Marker written once the translation has been copied into the client data.
+    pub fn translation_marker(&self) -> PathBuf {
+        self.install_dir.join("translation.json")
     }
 
     pub fn server_config_json(&self) -> PathBuf {
@@ -217,12 +264,30 @@ impl Settings {
             .join(format!("server{}", std::env::consts::EXE_SUFFIX))
     }
 
+    /// Base URL of the client data endpoint as the client should reach it (`data_url`).
+    pub fn client_data_url(&self) -> String {
+        let host = self.connect_host();
+        // IPv6 literals are bracketed inside a URL.
+        let host = if host.contains(':') {
+            format!("[{host}]")
+        } else {
+            host
+        };
+        format!("http://{host}:{}/data", self.client_data_port)
+    }
+
     /// Address the client should use to reach the game server.
     pub fn connect_host(&self) -> String {
         let public = self.public_host.trim();
         if !public.is_empty() {
             return public.to_string();
         }
+        self.server_probe_host()
+    }
+
+    /// Address the launcher checks to see whether the server accepts connections on this
+    /// machine: the bind host, with the wildcard addresses mapped to loopback.
+    pub fn server_probe_host(&self) -> String {
         match self.server_host.as_str() {
             "0.0.0.0" => "127.0.0.1".into(),
             "::" | "[::]" => "::1".into(),
@@ -240,25 +305,21 @@ impl Settings {
         self.client_dir().join("Cargo.toml").is_file()
     }
 
-    pub fn translation_re_cloned(&self) -> bool {
-        self.translation_re_source().join("data").is_dir()
+    pub fn bot_cloned(&self) -> bool {
+        self.bot_dir().join("Cargo.toml").is_file()
     }
 
-    pub fn translation_pre_cloned(&self) -> bool {
-        self.translation_pre_dir().join("data").is_dir()
+    /// All layers of the clone must be present, so a leftover clone of the old
+    /// zackdreaver translation is not mistaken for a complete one.
+    pub fn translation_cloned(&self) -> bool {
+        self.translation_sources()
+            .iter()
+            .all(|source| source.join("data").is_dir())
     }
 
-    /// True once both translation layers were copied over the client data.
+    /// True once the translation was copied over the client data.
     pub fn translation_applied(&self) -> bool {
-        self.translation_re_applied() && self.translation_pre_applied()
-    }
-
-    pub fn translation_re_applied(&self) -> bool {
-        self.translation_marker_matches(&self.translation_re_marker())
-    }
-
-    pub fn translation_pre_applied(&self) -> bool {
-        self.translation_marker_matches(&self.translation_pre_marker())
+        self.translation_marker_matches(&self.translation_marker())
     }
 
     /// A marker only counts when it was written for the current destination.
@@ -286,14 +347,89 @@ impl Settings {
         self.server_bin().is_file()
     }
 
+    /// Checks every number the menu lets the user type, so an out-of-range value never reaches a
+    /// generated config file (for example a hand-edited `ro-sppack.json`).
+    pub fn validate(&self) -> Result<(), String> {
+        let rates = [
+            ("Base EXP rate", self.base_exp_rate),
+            ("Job EXP rate", self.job_exp_rate),
+            ("Drop rate", self.drop_rate),
+            ("Card drop rate", self.drop_rate_card),
+            ("MVP drop rate", self.drop_rate_mvp),
+        ];
+        for (name, value) in rates {
+            check_range(name, value, &RATE_RANGE)?;
+        }
+        check_range("Mob density", self.mob_density, &MOB_DENSITY_RANGE)?;
+        check_range("Packet version", self.packetver, &PACKETVER_RANGE)?;
+        check_range("Bot count", self.bot_count, &BOT_COUNT_RANGE)?;
+
+        let mut ports = vec![
+            ("Game port", self.game_port),
+            ("Client data port", self.client_data_port),
+            ("Reference port", self.reference_port),
+        ];
+        if self.bot_api_enabled {
+            ports.push(("Bot API port", self.bot_api_port));
+        }
+        for (name, port) in &ports {
+            check_range(name, *port, &PORT_RANGE)?;
+        }
+        for (index, (name, port)) in ports.iter().enumerate() {
+            if let Some((other, _)) = ports[..index].iter().find(|(_, earlier)| earlier == port) {
+                return Err(format!(
+                    "{name} and {other} are both {port}; choose different ports"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn client_built(&self) -> bool {
         self.client_bin().is_file()
+    }
+
+    pub fn bot_built(&self) -> bool {
+        self.bot_bin().is_file()
+    }
+
+    /// Ports the server opens once it is initialized. The launcher waits for all of them before it
+    /// starts the client and the bots.
+    pub fn server_ports(&self) -> Vec<u16> {
+        let mut ports = vec![self.game_port, self.client_data_port, self.reference_port];
+        if self.bot_api_enabled {
+            ports.push(self.bot_api_port);
+        }
+        ports
+    }
+}
+
+/// `value` must be a finite number inside `range`.
+fn check_range<T: Copy + Into<f64>>(
+    name: &str,
+    value: T,
+    range: &RangeInclusive<f64>,
+) -> Result<(), String> {
+    let number: f64 = value.into();
+    if number.is_finite() && range.contains(&number) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{name} must be between {} and {}",
+            range.start(),
+            range.end()
+        ))
     }
 }
 
 /// Default client repository (native client replacing roBrowserLegacy).
 pub fn default_client_repo() -> String {
     "https://github.com/pts1667/nostalro-client.git".into()
+}
+
+/// Default translation repository (renewal base + pre-renewal + compatibility).
+pub fn default_translation_repo() -> String {
+    "https://github.com/llchrisll/ROenglishRE.git".into()
 }
 
 /// Folder the launcher executable lives in.
@@ -339,21 +475,47 @@ mod translation_marker_tests {
 
         // Marker from the old webroot layout: no `extracted` field -> stale.
         fs::write(
-            settings.translation_pre_marker(),
+            settings.translation_marker(),
             r#"{"webroot":"C:\\old\\webroot"}"#,
         )
         .unwrap();
-        assert!(!settings.translation_pre_applied());
+        assert!(!settings.translation_applied());
 
         // Marker written for the current destination -> applied.
         let marker = serde_json::json!({ "extracted": settings.client_extracted_dir().display().to_string() });
-        fs::write(settings.translation_pre_marker(), marker.to_string()).unwrap();
-        assert!(settings.translation_pre_applied());
+        fs::write(settings.translation_marker(), marker.to_string()).unwrap();
+        assert!(settings.translation_applied());
 
         // Extraction folder gone -> stale again.
         fs::remove_dir_all(settings.client_extracted_dir()).unwrap();
-        assert!(!settings.translation_pre_applied());
+        assert!(!settings.translation_applied());
         fs::remove_dir_all(&install).ok();
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_translation_repositories_are_replaced() {
+        let mut settings: Settings = serde_json::from_str(
+            r#"{
+                "translation_repo": "https://github.com/zackdreaver/ROenglishRE.git",
+                "translation_re_repo": "https://github.com/zackdreaver/ROenglishRE.git",
+                "translation_pre_repo": "https://github.com/zackdreaver/ROenglishPRE.git"
+            }"#,
+        )
+        .unwrap();
+        settings.migrate();
+        assert_eq!(settings.translation_repo, default_translation_repo());
+
+        // A custom repository is kept as is.
+        let mut custom: Settings =
+            serde_json::from_str(r#"{"translation_repo":"https://example.com/my/fork.git"}"#)
+                .unwrap();
+        custom.migrate();
+        assert_eq!(custom.translation_repo, "https://example.com/my/fork.git");
     }
 }
 
@@ -373,5 +535,35 @@ mod debug_log_tests {
     fn settings_files_without_the_option_keep_it_off() {
         let settings: Settings = serde_json::from_str(r#"{"game_port": 7000}"#).unwrap();
         assert!(!settings.debug_log);
+    }
+}
+
+#[cfg(test)]
+mod bot_tests {
+    use super::Settings;
+
+    #[test]
+    fn bots_read_the_server_config_and_stop_on_stdin() {
+        let settings = Settings {
+            bot_count: 12,
+            bot_api_port: 7002,
+            reference_port: 7004,
+            ..Settings::default()
+        };
+        let args = settings.bot_args();
+        assert_eq!(args[..3], ["run", "--bots", "12"]);
+        let index = args.iter().position(|arg| arg == "--server-dir").unwrap();
+        assert_eq!(args[index + 1], settings.server_dir().display().to_string());
+        assert!(args.iter().any(|arg| arg == "--stop-on-stdin"));
+        assert!(settings.server_ports().contains(&7002));
+        assert!(settings.server_ports().contains(&7004));
+    }
+
+    #[test]
+    fn settings_files_from_before_the_bots_launch_fifty() {
+        let settings: Settings = serde_json::from_str(r#"{"game_port": 7000}"#).unwrap();
+        assert!(settings.launch_bots);
+        assert_eq!(settings.bot_count, 50);
+        assert_eq!(settings.reference_port, 6904);
     }
 }
