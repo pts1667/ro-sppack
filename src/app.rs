@@ -1358,7 +1358,12 @@ impl App {
                         ui.label("Model share");
                         ui.horizontal(|ui| {
                             let default = self.settings.bot_model.default_share();
-                            optional_field(ui, "bot_model_share", &mut self.settings.bot_model_share, default, SHARE_RANGE);
+                            // Each model has its own field, typed text included.
+                            let (name, share) = match self.settings.bot_model {
+                                BotModel::Llm => ("bot_llm_share", &mut self.settings.bot_llm_share),
+                                _ => ("bot_decision_share", &mut self.settings.bot_decision_share),
+                            };
+                            optional_field(ui, name, share, default, SHARE_RANGE);
                             ui.label(
                                 RichText::new(format!("of the goal choices, 0 to 1 (default {default})"))
                                     .small()

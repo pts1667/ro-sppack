@@ -112,7 +112,7 @@ the bots start:
 | Decision model server | `http://127.0.0.1:9931` | `--s1-url` |
 | LLM server, model name, thinking budget, temperature | `http://127.0.0.1:8080`, `local-model`, 2048 tokens, 0.3 | `--llm-url`, `--llm-model`, `--llm-think`, `--llm-temp` |
 | Strategist memory (LLM) | fresh prompt each step | `--context skill-state` / `history` |
-| Model share of the goal choices | the bots' default: 0.25 decision model, 1 LLM | `--llm-share` |
+| Model share of the goal choices (kept per model) | the bots' default: 0.25 decision model, 1 LLM | `--llm-share` |
 | Sessions | take turns, 30 to 60 minutes | `--session 30-60`, or `0` to stay in the game |
 | Pool | twice the bots | `--pool` |
 | Join gap, strategist period | 3 s, 45 s | `--join-gap`, `--strategist-period` |

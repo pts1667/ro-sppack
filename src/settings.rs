@@ -136,9 +136,11 @@ pub struct Settings {
     pub bot_llm_think: u32,
     pub bot_llm_temperature: f32,
     pub bot_context: BotContext,
-    /// Share of the goal choices that go to the model (`--llm-share`); `None` keeps the bots'
-    /// default for the model.
-    pub bot_model_share: Option<f32>,
+    /// Share of the goal choices that go to the decision model and to the LLM (`--llm-share`),
+    /// each kept apart so switching models brings the other's back; `None` keeps the bots' default
+    /// for that model.
+    pub bot_decision_share: Option<f32>,
+    pub bot_llm_share: Option<f32>,
     /// Bots log off after a session of `bot_session_min`..`bot_session_max` minutes and a resting
     /// character takes their place. Without it every bot stays in the game (`--session 0`).
     pub bot_sessions: bool,
@@ -215,7 +217,8 @@ impl Default for Settings {
             bot_llm_think: 2048,
             bot_llm_temperature: 0.3,
             bot_context: BotContext::SkillState,
-            bot_model_share: None,
+            bot_decision_share: None,
+            bot_llm_share: None,
             bot_sessions: true,
             bot_session_min: 30,
             bot_session_max: 60,
@@ -363,9 +366,7 @@ impl Settings {
             args.push(name.into());
             args.push(value);
         };
-        if self.bot_model != BotModel::None
-            && let Some(share) = self.bot_model_share
-        {
+        if let Some(share) = self.bot_model_share() {
             push("--llm-share", share.to_string());
         }
         if self.bot_sessions {
@@ -401,6 +402,15 @@ impl Settings {
         self.bot_pool
             .unwrap_or(self.bot_count * 2)
             .max(self.bot_count)
+    }
+
+    /// The share of the goal choices set for the model the bots use; `None` for its default.
+    pub fn bot_model_share(&self) -> Option<f32> {
+        match self.bot_model {
+            BotModel::DecisionModel => self.bot_decision_share,
+            BotModel::Llm => self.bot_llm_share,
+            BotModel::None => None,
+        }
     }
 
     /// The model server the bots use, if any.
@@ -633,7 +643,10 @@ impl Settings {
             self.bot_llm_temperature,
             &LLM_TEMPERATURE_RANGE,
         )?;
-        if let Some(share) = self.bot_model_share {
+        for share in [self.bot_decision_share, self.bot_llm_share]
+            .into_iter()
+            .flatten()
+        {
             check_range("Model share", share, &SHARE_RANGE)?;
         }
         self.server_overrides()?;
@@ -874,7 +887,7 @@ mod bot_tests {
         let llm = Settings {
             bot_model: BotModel::Llm,
             bot_llm_url: " http://10.0.0.2:8080 ".into(),
-            bot_model_share: Some(0.5),
+            bot_llm_share: Some(0.5),
             bot_sessions: false,
             bot_forum: false,
             bot_solo: true,
@@ -901,7 +914,8 @@ mod bot_tests {
 
         let silent = Settings {
             bot_model: BotModel::None,
-            bot_model_share: Some(0.5),
+            bot_decision_share: Some(0.5),
+            bot_llm_share: Some(0.5),
             ..Settings::default()
         };
         let args = silent.bot_args();
@@ -912,6 +926,31 @@ mod bot_tests {
                 .any(|arg| arg == "--voice" || arg == "--llm-share")
         );
         assert_eq!(silent.bot_model_url(), None);
+    }
+
+    #[test]
+    fn each_model_keeps_its_own_share() {
+        let value = |settings: &Settings| {
+            let args = settings.bot_args();
+            let index = args.iter().position(|arg| arg == "--llm-share")?;
+            args.get(index + 1).cloned()
+        };
+        // A share set for the LLM does not follow the switch back to the decision model.
+        let mut settings = Settings {
+            bot_model: BotModel::Llm,
+            bot_llm_share: Some(1.0),
+            ..Settings::default()
+        };
+        assert_eq!(value(&settings).as_deref(), Some("1"));
+        settings.bot_model = BotModel::DecisionModel;
+        assert_eq!(value(&settings), None);
+        settings.bot_decision_share = Some(0.4);
+        assert_eq!(value(&settings).as_deref(), Some("0.4"));
+        settings.bot_model = BotModel::Llm;
+        assert_eq!(value(&settings).as_deref(), Some("1"));
+        // The URLs are kept apart too.
+        settings.bot_model = BotModel::DecisionModel;
+        assert_eq!(settings.bot_model_url(), Some("http://127.0.0.1:9931"));
     }
 
     #[test]
