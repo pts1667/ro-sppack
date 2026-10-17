@@ -133,6 +133,8 @@ pub struct App {
     /// The model server URL the Bots page checked last, and whether it answered (`None` while
     /// checking).
     endpoint_check: Option<(String, Option<bool>)>,
+    /// Why the last PLAY did not get the game running, shown on the home screen.
+    launch_error: Option<String>,
 
     logs: VecDeque<LogLine>,
     log_files: Arc<LogFiles>,
@@ -205,6 +207,7 @@ impl App {
             cargo_units: None,
             cargo_compiled: 0,
             endpoint_check: None,
+            launch_error: None,
             logs: VecDeque::new(),
             log_files: LogFiles::new(),
             log_file_error_shown: false,
@@ -342,6 +345,8 @@ impl App {
                         Err(error) => {
                             self.client_waiting = false;
                             self.bots_waiting = false;
+                            self.launch_error =
+                                Some(format!("The game server did not start: {error}."));
                             self.push_log(
                                 "server",
                                 format!("{error}; client and bots not started"),
@@ -352,6 +357,12 @@ impl App {
                 }
                 AppEvent::ProcExited { name, code } => {
                     if name == "server" {
+                        if !self.server_stopping && code != Some(0) {
+                            self.launch_error = Some(format!(
+                                "The game server stopped unexpectedly (exit code {}).",
+                                code.map_or("unknown".into(), |code| code.to_string())
+                            ));
+                        }
                         self.forget_server();
                     }
                     if name == "client" {
@@ -583,11 +594,27 @@ impl App {
             self.push_log(
                 "server",
                 format!(
-                    "binary not found: {} (build it in the Setup tab)",
+                    "binary not found: {} (build it in Settings → Components)",
                     settings.server_bin().display()
                 ),
                 LogLevel::Warn,
             );
+            return;
+        }
+        // Another program on one of the ports (often a server started by hand) would make the new
+        // server fail, and the readiness check would take the other one's ports for this server.
+        let busy = busy_ports(&settings.server_probe_host(), &settings.server_ports());
+        if !busy.is_empty() {
+            let ports = busy
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let error = format!(
+                "Port {ports} is already in use by another program, perhaps a game server started outside the launcher. Stop it, or change the ports in Settings → Server."
+            );
+            self.push_log("server", format!("not started: {error}"), LogLevel::Error);
+            self.launch_error = Some(error);
             return;
         }
         if let Err(error) = config_gen::generate_server(&settings) {
@@ -596,6 +623,7 @@ impl App {
                 format!("configuration failed: {error}"),
                 LogLevel::Error,
             );
+            self.launch_error = Some(format!("The server configuration failed: {error}"));
             return;
         }
         if let Some(spawned) = self.spawn_managed(
@@ -637,7 +665,7 @@ impl App {
             self.push_log(
                 "client",
                 format!(
-                    "binary not found: {} (build it in the Setup tab)",
+                    "binary not found: {} (build it in Settings → Components)",
                     settings.client_bin().display()
                 ),
                 LogLevel::Warn,
@@ -698,7 +726,7 @@ impl App {
             self.push_log(
                 "bots",
                 format!(
-                    "binary not found: {} (build it in the Setup tab)",
+                    "binary not found: {} (build it in Settings → Components)",
                     settings.bot_bin().display()
                 ),
                 LogLevel::Warn,
@@ -951,6 +979,7 @@ impl App {
         if self.update.running() {
             return;
         }
+        self.launch_error = None;
 
         // start_server / start_client each regenerate their own configuration. start_client waits
         // for the server to accept connections, so the client is not started if the server failed.
@@ -2326,6 +2355,15 @@ fn spawn_readiness_check(
     });
 }
 
+/// The ports something on `host` already accepts connections on.
+fn busy_ports(host: &str, ports: &[u16]) -> Vec<u16> {
+    ports
+        .iter()
+        .copied()
+        .filter(|&port| port_accepts(host, port))
+        .collect()
+}
+
 fn port_accepts(host: &str, port: u16) -> bool {
     match (host, port).to_socket_addrs() {
         Ok(mut addrs) => {
@@ -2422,6 +2460,17 @@ mod tests {
         );
         assert_eq!(url_host_port("http://host:port"), None);
         assert_eq!(url_host_port(""), None);
+    }
+
+    #[test]
+    fn ports_another_program_listens_on_are_busy() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let taken = listener.local_addr().unwrap().port();
+        let free = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        assert_eq!(busy_ports("127.0.0.1", &[free, taken]), vec![taken]);
     }
 
     #[test]

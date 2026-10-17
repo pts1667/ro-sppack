@@ -253,8 +253,12 @@ volumes, graphic options):
   whenever something changes. If no file is there yet, a settings file left
   next to the executable by older builds is copied over automatically on first
   run.
-- **Ports in use.** Startup errors from rust-ro or the client appear in the
-  Logs; change the game port in Settings → Server and relaunch.
+- **Ports in use.** Before it starts the server, the launcher checks the game,
+  client data, reference and Bot API ports. If another program already listens
+  on one, often a server started by hand, the game is not started and the home
+  screen says which port: stop that program or change the ports in
+  Settings → Server. Other startup errors from rust-ro or the client appear in
+  red on the home screen too, with the details in Logs.
 - **Log files.** Everything in the Logs tab is also written to
   `<install dir>/logs`: `server.log`, `client.log` and `launcher.log` (setup
   jobs and launcher messages). Lines are flushed to disk about every 10

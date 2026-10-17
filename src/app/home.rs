@@ -440,6 +440,15 @@ impl App {
                     .unwrap_or_default(),
             };
         }
+        if let Some(error) = &self.launch_error {
+            return UpdateBar {
+                status: shorten(error, 110),
+                color: BAD,
+                fraction: 0.0,
+                detail: "Details in Logs.".into(),
+                elapsed: String::new(),
+            };
+        }
         let (status, color, fraction, detail) = match &self.update {
             UpdateState::Failed(error) => (
                 shorten(&format!("Update failed — {error}"), 90),
