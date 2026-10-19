@@ -8,6 +8,7 @@ use crate::config_gen;
 use crate::events::{AppEvent, LogLevel};
 use crate::jobs::{JobKind, JobRunner, kill_pid};
 use crate::log_files::LogFiles;
+use crate::plugins::{self, Plugin, PluginChoice};
 use crate::settings::{
     BOT_COUNT_RANGE, BOT_POOL_RANGE, BOT_SECONDS_RANGE, BOT_SESSION_RANGE, BotContext, BotModel,
     LEVEL_RANGE, LLM_TEMPERATURE_RANGE, LLM_THINK_RANGE, MOB_DENSITY_RANGE, PACKETVER_RANGE,
@@ -48,16 +49,18 @@ enum Page {
     General,
     Server,
     Bots,
+    Plugins,
     Components,
     Processes,
     Logs,
 }
 
 impl Page {
-    const ALL: [Page; 6] = [
+    const ALL: [Page; 7] = [
         Page::General,
         Page::Server,
         Page::Bots,
+        Page::Plugins,
         Page::Components,
         Page::Processes,
         Page::Logs,
@@ -68,6 +71,7 @@ impl Page {
             Page::General => "General",
             Page::Server => "Server",
             Page::Bots => "Bots",
+            Page::Plugins => "Plugins",
             Page::Components => "Components",
             Page::Processes => "Processes",
             Page::Logs => "Logs",
@@ -135,6 +139,9 @@ pub struct App {
     endpoint_check: Option<(String, Option<bool>)>,
     /// Why the last PLAY did not get the game running, shown on the home screen.
     launch_error: Option<String>,
+    /// The plugins installed with the server, found when the Plugins page first shows.
+    plugins: Option<Result<Vec<Plugin>, String>>,
+    plugins_refresh: bool,
 
     logs: VecDeque<LogLine>,
     log_files: Arc<LogFiles>,
@@ -208,6 +215,8 @@ impl App {
             cargo_compiled: 0,
             endpoint_check: None,
             launch_error: None,
+            plugins: None,
+            plugins_refresh: false,
             logs: VecDeque::new(),
             log_files: LogFiles::new(),
             log_file_error_shown: false,
@@ -521,6 +530,8 @@ impl App {
             UpdateState::Building => {
                 let changed = heads_text(&self.settings) != self.heads_before;
                 self.update = UpdateState::Done { changed };
+                // A pull may bring plugins or change their settings.
+                self.plugins = None;
                 self.push_log(
                     "launcher",
                     if changed {
@@ -1518,6 +1529,104 @@ impl App {
         });
     }
 
+    /// The server's plugins: a switch for each, and its settings in a section that opens.
+    fn plugins_page(&mut self, ui: &mut egui::Ui) {
+        let catalog = self.plugins.take().unwrap_or_else(|| {
+            config_gen::server_template(&self.settings)
+                .and_then(|config| plugins::discover(&self.settings.server_dir(), &config))
+        });
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Plugins add NPCs, events and rule changes to the server. Changes apply the next time it starts.")
+                    .small()
+                    .color(MUTED),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Refresh").on_hover_text("Look for plugins again, e.g. after copying one in").clicked() {
+                    self.plugins_refresh = true;
+                }
+            });
+        });
+        ui.add_space(6.0);
+        match &catalog {
+            Err(error) => {
+                ui.colored_label(WARN, error);
+            }
+            Ok(list) if list.is_empty() => {
+                ui.label(RichText::new("No plugins are installed. A plugin is a folder with a plugin.wasm in the server's plugins folder.").color(MUTED));
+            }
+            Ok(list) => {
+                for plugin in list {
+                    self.plugin_ui(ui, plugin);
+                    ui.add_space(4.0);
+                }
+            }
+        }
+        if let Ok(config) = config_gen::server_template(&self.settings)
+            && ui.button("Open plugins folder").clicked()
+        {
+            open_path(&plugins::plugins_dir(&self.settings.server_dir(), &config));
+        }
+        if !std::mem::take(&mut self.plugins_refresh) {
+            self.plugins = Some(catalog);
+        }
+    }
+
+    fn plugin_ui(&mut self, ui: &mut egui::Ui, plugin: &Plugin) {
+        // A plugin the launcher has no choice for shows its settings file as found, and is only
+        // taken over (its file rewritten) once something changes here.
+        let before = self
+            .settings
+            .plugins
+            .get(&plugin.name)
+            .cloned()
+            .unwrap_or_else(|| PluginChoice {
+                enabled: None,
+                settings: plugin.saved.clone(),
+            });
+        let mut choice = before.clone();
+        let title = match &plugin.manifest {
+            Ok(manifest) => manifest.title.clone(),
+            Err(_) => plugin.name.clone(),
+        };
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let id = ui.make_persistent_id(("plugin", &plugin.name));
+            egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
+                .show_header(ui, |ui| {
+                    let mut enabled = choice.enabled.unwrap_or(plugin.enabled_by_template);
+                    if ui
+                        .checkbox(&mut enabled, RichText::new(&title).strong())
+                        .on_hover_text("Loaded when the server starts")
+                        .changed()
+                    {
+                        choice.enabled = Some(enabled);
+                    }
+                    ui.label(RichText::new(&plugin.name).small().color(MUTED));
+                    if !choice.settings.is_empty() {
+                        let count = choice.settings.len();
+                        ui.label(
+                            RichText::new(format!(
+                                "{count} setting{} changed",
+                                if count == 1 { "" } else { "s" }
+                            ))
+                            .small()
+                            .color(WARN),
+                        );
+                    }
+                })
+                .body(|ui| match &plugin.manifest {
+                    Err(error) => {
+                        ui.colored_label(WARN, format!("Its settings cannot be shown: {error}."));
+                    }
+                    Ok(manifest) => plugin_settings_ui(ui, id, manifest, &mut choice),
+                });
+        });
+        if choice != before {
+            self.settings.plugins.insert(plugin.name.clone(), choice);
+        }
+    }
+
     fn components_page(&mut self, ui: &mut egui::Ui) {
         ui.label(RichText::new("Components").strong());
         ui.group(|ui| {
@@ -2226,6 +2335,201 @@ fn cargo_lock_packages(dir: &Path) -> Option<usize> {
     )
 }
 
+/// The settings of a plugin, each edited after the type of its default.
+fn plugin_settings_ui(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    manifest: &plugins::Manifest,
+    choice: &mut PluginChoice,
+) {
+    if !manifest.description.is_empty() {
+        ui.label(&manifest.description);
+        ui.add_space(4.0);
+    }
+    if manifest.config.is_empty() {
+        ui.label(RichText::new("It has no settings.").color(MUTED));
+        return;
+    }
+    let mut reset = Vec::new();
+    egui::Grid::new(id.with("settings"))
+        .num_columns(2)
+        .spacing([12.0, 10.0])
+        .show(ui, |ui| {
+            for (key, setting) in &manifest.config {
+                ui.label(RichText::new(key).monospace())
+                    .on_hover_text(&setting.description);
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        let current = choice.settings.get(key).unwrap_or(&setting.default);
+                        if let Some(value) =
+                            plugin_value_ui(ui, id.with(key), &setting.default, current)
+                        {
+                            if value == setting.default {
+                                choice.settings.remove(key);
+                            } else {
+                                choice.settings.insert(key.clone(), value);
+                            }
+                        }
+                        if choice.settings.contains_key(key)
+                            && ui
+                                .small_button("Default")
+                                .on_hover_text(format!(
+                                    "Back to {}",
+                                    compact_json(&setting.default)
+                                ))
+                                .clicked()
+                        {
+                            reset.push(key.clone());
+                        }
+                    });
+                    if !setting.description.is_empty() {
+                        ui.label(RichText::new(&setting.description).small().color(MUTED));
+                    }
+                });
+                ui.end_row();
+            }
+            // Settings an update took out of the plugin would refuse it at boot.
+            for key in choice.settings.keys() {
+                if !manifest.config.contains_key(key) {
+                    ui.label(RichText::new(key).monospace().color(BAD));
+                    ui.horizontal(|ui| {
+                        ui.colored_label(BAD, "no longer a setting of this plugin");
+                        if ui.small_button("Remove").clicked() {
+                            reset.push(key.clone());
+                        }
+                    });
+                    ui.end_row();
+                }
+            }
+        });
+    if !choice.settings.is_empty() && ui.button("All to defaults").clicked() {
+        reset.extend(choice.settings.keys().cloned());
+    }
+    for key in reset {
+        choice.settings.remove(&key);
+        // The typed text of the field follows the value again.
+        ui.data_mut(|data| data.remove::<String>(id.with(&key)));
+    }
+}
+
+/// Edits one plugin setting, typed after its default: a checkbox, a number, a text, or JSON for
+/// lists and objects. Returns the new value once it is valid and different.
+fn plugin_value_ui(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    default: &serde_json::Value,
+    current: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    use serde_json::Value;
+    let wide = (ui.available_width() - 70.0).clamp(120.0, 420.0);
+    match default {
+        Value::Bool(_) => {
+            let mut on = current.as_bool().unwrap_or(false);
+            ui.checkbox(&mut on, "")
+                .changed()
+                .then_some(Value::Bool(on))
+        }
+        Value::String(_) => {
+            let mut text = current.as_str().unwrap_or_default().to_string();
+            let editor = if text.contains('\n') || text.len() > 60 {
+                egui::TextEdit::multiline(&mut text).desired_rows(2)
+            } else {
+                egui::TextEdit::singleline(&mut text)
+            };
+            let changed = ui.add(editor.desired_width(wide)).changed();
+            changed.then_some(Value::String(text))
+        }
+        Value::Number(number) => {
+            let whole = !number.is_f64();
+            let mut text = ui
+                .data_mut(|data| data.get_temp::<String>(id))
+                .unwrap_or_else(|| current.to_string());
+            ui.add(egui::TextEdit::singleline(&mut text).desired_width(120.0));
+            let parsed = if whole {
+                text.trim()
+                    .parse::<i64>()
+                    .map(Value::from)
+                    .map_err(|_| "not a whole number")
+            } else {
+                text.trim()
+                    .parse::<f64>()
+                    .ok()
+                    .and_then(serde_json::Number::from_f64)
+                    .map(Value::Number)
+                    .ok_or("not a number")
+            };
+            ui.data_mut(|data| data.insert_temp(id, text));
+            match parsed {
+                Ok(value) => (value != *current).then_some(value),
+                Err(problem) => {
+                    ui.colored_label(BAD, problem);
+                    None
+                }
+            }
+        }
+        // Lists, objects, and settings whose default is null take JSON.
+        _ => {
+            let mut text = ui
+                .data_mut(|data| data.get_temp::<String>(id))
+                .unwrap_or_else(|| json_lines(current));
+            let rows = text.lines().count().clamp(1, 16);
+            ui.add(
+                egui::TextEdit::multiline(&mut text)
+                    .code_editor()
+                    .desired_rows(rows)
+                    .desired_width(wide),
+            );
+            let parsed = serde_json::from_str::<Value>(&text);
+            ui.data_mut(|data| data.insert_temp(id, text));
+            match parsed {
+                Ok(value)
+                    if !default.is_null()
+                        && plugins::json_type(&value) != plugins::json_type(default) =>
+                {
+                    ui.colored_label(BAD, format!("must be {}", plugins::json_type(default)));
+                    None
+                }
+                Ok(value) => (value != *current).then_some(value),
+                Err(error) => {
+                    ui.colored_label(BAD, format!("not valid JSON: {error}"));
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// A list or object with one element per line, e.g. a shop's stock with an item per line.
+fn json_lines(value: &serde_json::Value) -> String {
+    use serde_json::Value;
+    let lines: Vec<String> = match value {
+        Value::Array(items) if !items.is_empty() => {
+            items.iter().map(|item| format!("  {item}")).collect()
+        }
+        Value::Object(fields) if !fields.is_empty() => fields
+            .iter()
+            .map(|(key, field)| format!("  {}: {field}", Value::from(key.as_str())))
+            .collect(),
+        _ => return value.to_string(),
+    };
+    let (open, close) = if value.is_array() {
+        ('[', ']')
+    } else {
+        ('{', '}')
+    };
+    format!("{open}\n{}\n{close}", lines.join(",\n"))
+}
+
+/// A value on one line, shortened for a tooltip.
+fn compact_json(value: &serde_json::Value) -> String {
+    let text = value.to_string();
+    if text.chars().count() > 60 {
+        format!("{}…", text.chars().take(60).collect::<String>())
+    } else {
+        text
+    }
+}
+
 /// An optional setting: unticked it keeps the bots' default (`default`, shown greyed out), ticked
 /// its number is typed in.
 fn optional_field<T>(
@@ -2434,6 +2738,24 @@ mod tests {
         // The pid is never looked at: the exit flag says it is gone.
         wait_or_kill(u32::MAX, &AtomicBool::new(true), Duration::from_secs(30));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn plugin_lists_show_an_element_per_line() {
+        let stock =
+            serde_json::json!([{ "item_id": 501, "price": 40 }, { "item_id": 502, "price": 160 }]);
+        let text = json_lines(&stock);
+        assert_eq!(
+            text,
+            "[\n  {\"item_id\":501,\"price\":40},\n  {\"item_id\":502,\"price\":160}\n]"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+            stock
+        );
+        let rates = serde_json::json!({ "a b": 1, "c": [2] });
+        assert_eq!(json_lines(&rates), "{\n  \"a b\": 1,\n  \"c\": [2]\n}");
+        assert_eq!(json_lines(&serde_json::json!([])), "[]");
     }
 
     #[test]

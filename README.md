@@ -139,6 +139,32 @@ chat.
   stop them by hand while the server runs.
 - Their output goes to the Logs tab and `logs/bots.log`.
 
+## Plugins
+
+**Settings → Plugins** lists the server's plugins: every folder with a
+`plugin.wasm` in its plugins folder (`rust-ro/config/plugins` unless
+`scripting.plugins_dir` says otherwise). See rust-ro's `docs/plugins.md`.
+
+- The checkbox in a plugin's header loads it when the server starts. A plugin
+  you haven't ticked or unticked keeps what `config.template.json` says (the
+  examples ship off). The launcher sets `enabled` on the plugin's entry in
+  `scripting.plugins`, keeping its place and `capabilities`, or appends it.
+- Open a plugin to edit its settings. The launcher reads each plugin's
+  `info.json` (title, description, settings and defaults) from inside its
+  `plugin.wasm`, and the type of a setting's default picks its field: a
+  checkbox, a number (whole when the default is whole), a text, or JSON for
+  lists and objects, one element per line. **Default** puts a setting back.
+- Settings that differ from the defaults are written to
+  `config/plugins/<name>.json`, which the server reads; with none, the launcher
+  removes that file. A file you wrote by hand is shown on the page and kept
+  until you change that plugin's settings there.
+- A setting the plugin no longer has after an update is shown in red with a
+  **Remove** button. The server would refuse the plugin over it, so while the
+  plugin is enabled the launcher does not write the configuration until it is
+  removed.
+- Changes apply the next time the server starts. **Refresh** looks for plugins
+  again after you copy one into the folder.
+
 ## Folder layout
 
 ```
@@ -194,7 +220,9 @@ ro-sppack.exe --setup > setup.log 2>&1
 - `client_data` (the `/data` endpoint: port 6903 by default, bound to the bind host),
 - `bots` (the bot API: enabled flag and port 6902 by default; with the API
   on, `max_bots` and `max_registered_bots` of at least twice the bot count),
-- `reference` (`/db` and `/wiki`, which the bots plan with: enabled, port 6904 by default).
+- `reference` (`/db` and `/wiki`, which the bots plan with: enabled, port 6904 by default),
+- `scripting.plugins` (see [Plugins](#plugins)), with each plugin's settings in
+  `config/plugins/<name>.json`.
 
 `config.json` is written from the template each time, so edit other server
 options under **More server options** on the Server page: a JSON object such

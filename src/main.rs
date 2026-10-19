@@ -6,6 +6,7 @@ mod config_gen;
 mod events;
 mod jobs;
 mod log_files;
+mod plugins;
 mod settings;
 
 use events::AppEvent;

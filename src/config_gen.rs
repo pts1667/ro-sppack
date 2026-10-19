@@ -42,16 +42,24 @@ fn create_directories(settings: &Settings) -> Result<(), String> {
     Ok(())
 }
 
-fn generate_server_config(settings: &Settings) -> Result<(), String> {
+/// The server's `config.template.json` with the "More server options" merged in: the
+/// configuration before the menu's values are written.
+pub fn server_template(settings: &Settings) -> Result<Value, String> {
     let template_path = settings.server_dir().join("config.template.json");
     let text = std::fs::read_to_string(&template_path)
         .map_err(|e| format!("read {} (is rust-ro cloned?): {e}", template_path.display()))?;
     let mut config: Value = serde_json::from_str(&text)
         .map_err(|e| format!("parse {}: {e}", template_path.display()))?;
-    // The overrides go in first: what the menu sets below wins over them.
     for (key, value) in settings.server_overrides()? {
         merge(&mut config[key.as_str()], value);
     }
+    Ok(config)
+}
+
+fn generate_server_config(settings: &Settings) -> Result<(), String> {
+    // The overrides go in first: what the menu sets below wins over them.
+    let mut config = server_template(settings)?;
+    crate::plugins::apply(&settings.server_dir(), &mut config, &settings.plugins)?;
 
     let server = config
         .get_mut("server")

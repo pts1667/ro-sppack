@@ -719,6 +719,7 @@ impl App {
                             self.server_overrides_ui(ui);
                         }
                         Page::Bots => self.bots_page(ui),
+                        Page::Plugins => self.plugins_page(ui),
                         Page::Components => self.components_page(ui),
                         Page::Processes => self.dashboard_tab(ui),
                         Page::Logs => {}

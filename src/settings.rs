@@ -1,6 +1,9 @@
 //! Persisted launcher settings and the paths derived from them.
 
+use crate::plugins::PluginChoice;
+
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
@@ -170,6 +173,8 @@ pub struct Settings {
     /// A JSON object merged into the server's config.json before the menu's values are written:
     /// every other server option. Empty for none.
     pub server_overrides: String,
+    /// The server's plugins the launcher turns on or off or configures, by name.
+    pub plugins: BTreeMap<String, PluginChoice>,
 
     pub build_release: bool,
     /// "Play without updating": the launcher does not pull and rebuild when it starts. An install
@@ -234,6 +239,7 @@ impl Default for Settings {
             server_name: "Rust ragnarok".into(),
             account_registration: false,
             server_overrides: String::new(),
+            plugins: BTreeMap::new(),
             build_release: true,
             skip_update: false,
             debug_log: false,
