@@ -2,7 +2,7 @@
 name = "ro-sppack"
 version = "0.1.0"
 edition = "2024"
-description = "Setup dashboard and one-click launcher for a self-hosted Ragnarok Online package (rust-ro server + roBrowserLegacy web client + asset server)"
+description = "Setup dashboard and one-click launcher for a self-hosted Ragnarok Online package (rust-ro server + notalrus client + asset server)"
 license = "MIT"
 
 [dependencies]
