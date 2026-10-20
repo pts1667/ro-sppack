@@ -803,6 +803,30 @@ pub fn git_head(dir: &Path) -> Option<String> {
     (short.len() == 7 && short.chars().all(|c| c.is_ascii_hexdigit())).then_some(short)
 }
 
+/// Clears the bots' copy of the server's reference data (`rust-ro-bot/cache/db`) when it was
+/// made from another server commit. The bots keep every answer for good, so after a server update
+/// they would go on looking for NPCs, shops and warps that are no longer there. Returns whether
+/// there was a copy to clear.
+pub fn clear_stale_bot_cache(settings: &Settings) -> Result<bool, String> {
+    let Some(head) = git_head(&settings.server_dir()) else {
+        return Ok(false);
+    };
+    let stamp = settings.bot_cache_stamp();
+    if std::fs::read_to_string(&stamp).is_ok_and(|made_for| made_for.trim() == head) {
+        return Ok(false);
+    }
+    let cache = settings.bot_cache_dir();
+    let cleared = cache.is_dir();
+    if cleared {
+        std::fs::remove_dir_all(&cache).map_err(|e| format!("clear {}: {e}", cache.display()))?;
+    }
+    if let Some(parent) = stamp.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    std::fs::write(&stamp, &head).map_err(|e| format!("write {}: {e}", stamp.display()))?;
+    Ok(cleared)
+}
+
 /// Kill a process and its children. Used for both jobs and managed processes.
 pub fn kill_pid(pid: u32) {
     #[cfg(windows)]
@@ -1008,6 +1032,45 @@ mod tests {
         assert_eq!(git_head(&dir).as_deref(), Some("abcdef0"));
         assert_eq!(git_head(&dir.join("missing")), None);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_bot_cache_is_cleared_once_per_server_commit() {
+        let install =
+            std::env::temp_dir().join(format!("ro-sppack-bot-cache-{}", std::process::id()));
+        let settings = Settings {
+            install_dir: install.clone(),
+            ..Settings::default()
+        };
+        let git = settings.server_dir().join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+        std::fs::write(
+            git.join("HEAD"),
+            "0123456789abcdef0123456789abcdef01234567\n",
+        )
+        .unwrap();
+        let cached = settings.bot_cache_dir().join("db_maps_prontera.json");
+        std::fs::create_dir_all(settings.bot_cache_dir()).unwrap();
+        std::fs::write(&cached, "{}").unwrap();
+
+        // A cache with no commit recorded is from before the launcher kept one.
+        assert_eq!(clear_stale_bot_cache(&settings), Ok(true));
+        assert!(!cached.exists());
+
+        // The bots fill it again from the same server: it stays.
+        std::fs::create_dir_all(settings.bot_cache_dir()).unwrap();
+        std::fs::write(&cached, "{}").unwrap();
+        assert_eq!(clear_stale_bot_cache(&settings), Ok(false));
+        assert!(cached.exists());
+
+        std::fs::write(
+            git.join("HEAD"),
+            "fedcba9876543210fedcba9876543210fedcba98\n",
+        )
+        .unwrap();
+        assert_eq!(clear_stale_bot_cache(&settings), Ok(true));
+        assert!(!cached.exists());
+        std::fs::remove_dir_all(&install).ok();
     }
 
     #[test]

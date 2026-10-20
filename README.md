@@ -172,7 +172,7 @@ chat.
   rust-ro/                    cloned server repository (config.json is regenerated)
     config/client-data/       game data the server serves on /data (built from the kRO archives)
   nostalro-client/            cloned native client repository
-  rust-ro-bot/                cloned bot repository (state/ and cache/ hold the bots' memory and the reference cache)
+  rust-ro-bot/                cloned bot repository (state/ and cache/ hold the bots' memory and the reference cache; an update that brings a new server commit clears the cache)
     config.json               managed connection/data fields + your in-game settings
     data/
       extracted/              English translation; checked before the served data

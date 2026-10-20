@@ -532,6 +532,20 @@ impl App {
                 self.update = UpdateState::Done { changed };
                 // A pull may bring plugins or change their settings.
                 self.plugins = None;
+                match crate::jobs::clear_stale_bot_cache(&self.settings) {
+                    Ok(true) => self.push_log(
+                        "bots",
+                        "cleared their copy of the server's data, made from another server version"
+                            .into(),
+                        LogLevel::Info,
+                    ),
+                    Ok(false) => {}
+                    Err(error) => self.push_log(
+                        "bots",
+                        format!("could not clear their copy of the server's data: {error}"),
+                        LogLevel::Warn,
+                    ),
+                }
                 self.push_log(
                     "launcher",
                     if changed {

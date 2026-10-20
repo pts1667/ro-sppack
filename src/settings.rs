@@ -325,6 +325,16 @@ impl Settings {
         self.install_dir.join("rust-ro-bot")
     }
 
+    /// The bots' copy of the server's reference data (`/db`), which they never refresh.
+    pub fn bot_cache_dir(&self) -> PathBuf {
+        self.bot_dir().join("cache").join("db")
+    }
+
+    /// The server commit [`Settings::bot_cache_dir`] was made from.
+    pub fn bot_cache_stamp(&self) -> PathBuf {
+        self.bot_dir().join("cache").join("server-commit.txt")
+    }
+
     pub fn bot_bin(&self) -> PathBuf {
         self.bot_dir()
             .join("target")
