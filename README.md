@@ -239,7 +239,7 @@ volumes, graphic options):
   and the client data port,
 - `grf_paths` — cleared: the client gets everything from `data_url`,
 - `data_dir = data/extracted` when the translation was applied,
-- `bgm_path` — removed, so BGM tracks are read from `bgm/` on `data_url`.
+- `bgm_path` — the server's `rust-ro/config/client-data/bgm`, read straight from disk, so a track copied there after the client data build plays even though the endpoint's file list does not name it.
 
 ## Notes
 

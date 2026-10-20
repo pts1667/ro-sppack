@@ -164,12 +164,19 @@ fn generate_client_config(settings: &Settings) -> Result<(), String> {
 
     // Every resource comes from the server's `/data` endpoint. The client resolves data_dir first
     // (the translation, when applied), then data_url, then grf_paths. Archives copied by earlier
-    // launcher versions are no longer listed, and the BGM tracks come from `bgm/` on the endpoint.
+    // launcher versions are no longer listed.
     config["data_url"] = json!(settings.client_data_url());
     config["grf_paths"] = json!([]);
-    if let Some(object) = config.as_object_mut() {
-        object.remove("bgm_path");
-    }
+    // The client fetches only what the endpoint's file list names, and tracks copied into the
+    // served `bgm/` after the setup ran are not in it. The server is on this machine, so the
+    // client reads its BGM folder directly, before asking the endpoint.
+    config["bgm_path"] = json!(
+        settings
+            .server_client_data_dir()
+            .join("bgm")
+            .display()
+            .to_string()
+    );
     if settings.client_extracted_dir().is_dir() {
         config["data_dir"] = json!("data/extracted");
     }
@@ -292,7 +299,17 @@ mod tests {
         assert_eq!(config["login_servers"][0]["packetver"], json!(20120307));
         assert_eq!(config["data_url"], json!("http://127.0.0.1:7003/data"));
         assert_eq!(config["grf_paths"], json!([]));
-        assert!(config.get("bgm_path").is_none());
+        assert_eq!(
+            config["bgm_path"],
+            json!(
+                root.join("rust-ro")
+                    .join("config")
+                    .join("client-data")
+                    .join("bgm")
+                    .display()
+                    .to_string()
+            )
+        );
         assert_eq!(config["data_dir"], json!("data/extracted"));
         // Untouched fields written by the client are preserved.
         assert_eq!(config["dpi_scale"], json!(150.0));
