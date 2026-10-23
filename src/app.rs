@@ -1730,15 +1730,6 @@ impl App {
                 .small()
                 .color(MUTED),
         );
-        if settings.server_cloned()
-            && let Some(channel) = crate::jobs::read_toolchain_channel(&settings.server_dir())
-        {
-            ui.label(
-                RichText::new(format!("pinned toolchain: {channel}"))
-                    .small()
-                    .color(MUTED),
-            );
-        }
         if settings.server_cloned() {
             ui.horizontal(|ui| {
                 if ui.button("Build").clicked() {

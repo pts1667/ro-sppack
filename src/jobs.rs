@@ -339,8 +339,7 @@ fn run_job(
             release,
             package,
         } => {
-            let mut cargo_args = pinned_toolchain(job.id, dir, tx, ctx, cancel, pid_slot);
-            cargo_args.push("build".into());
+            let mut cargo_args = vec!["build".to_string()];
             if *release {
                 cargo_args.push("--release".into());
             }
@@ -374,7 +373,7 @@ fn run_job(
             }
             // The tool runs from the server folder, so `--out` lands in the root the
             // server publishes (`client_data.root` in its config).
-            let mut cargo_args = pinned_toolchain(job.id, server_dir, tx, ctx, cancel, pid_slot);
+            let mut cargo_args = Vec::new();
             cargo_args.extend(
                 [
                     "run",
@@ -519,97 +518,6 @@ fn spawn_reader<R: Read + Send + 'static>(
             }
         }
     })
-}
-
-/// Read the pinned toolchain channel from `rust-toolchain.toml` (or the legacy
-/// `rust-toolchain` file) in `dir`. Returns `None` when there is no pin.
-pub fn read_toolchain_channel(dir: &Path) -> Option<String> {
-    if let Ok(text) = std::fs::read_to_string(dir.join("rust-toolchain.toml")) {
-        for line in text.lines() {
-            let line = line.trim();
-            if let Some(rest) = line.strip_prefix("channel") {
-                let value = rest.trim_start().strip_prefix('=')?.trim();
-                let channel = value.trim_matches('"').trim_matches('\'').trim();
-                if !channel.is_empty() {
-                    return Some(channel.to_string());
-                }
-            }
-        }
-    }
-    if let Ok(text) = std::fs::read_to_string(dir.join("rust-toolchain")) {
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('[') || line.starts_with('#') {
-                continue;
-            }
-            return Some(line.trim_matches('"').trim_matches('\'').to_string());
-        }
-    }
-    None
-}
-
-/// Whether the rustup proxy is available to install or activate pinned toolchains.
-fn rustup_available() -> bool {
-    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
-        Command::new("rustup")
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .stdin(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
-    })
-}
-
-/// The `+<channel>` argument for the toolchain pinned by `dir`, or nothing when there is no pin or
-/// rustup is missing. rust-ro and the client pin their toolchain in rust-toolchain.toml, so it is
-/// installed explicitly (a no-op when present) and used instead of the default toolchain.
-fn pinned_toolchain(
-    id: u64,
-    dir: &Path,
-    tx: &Sender<AppEvent>,
-    ctx: &egui::Context,
-    cancel: &AtomicBool,
-    pid_slot: &AtomicU32,
-) -> Vec<String> {
-    let Some(channel) = read_toolchain_channel(dir) else {
-        return Vec::new();
-    };
-    if !rustup_available() {
-        return Vec::new();
-    }
-    let _ = tx.send(AppEvent::JobLog {
-        id,
-        line: format!("ensuring pinned toolchain `{channel}` is installed"),
-    });
-    ctx.request_repaint();
-    let installed = run_program(
-        id,
-        "rustup",
-        &[
-            "toolchain".into(),
-            "install".into(),
-            channel.clone(),
-            "--profile".into(),
-            "minimal".into(),
-        ],
-        dir,
-        &[],
-        tx,
-        ctx,
-        cancel,
-        pid_slot,
-    );
-    if let Err(error) = installed {
-        let _ = tx.send(AppEvent::JobLog {
-            id,
-            line: format!("rustup could not prepare `{channel}` ({error}); cargo will try again"),
-        });
-        ctx.request_repaint();
-    }
-    vec![format!("+{channel}")]
 }
 
 /// Compute the sequential setup plan. `force` rebuilds even when an artifact
@@ -856,37 +764,6 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU32};
     use std::sync::mpsc;
-
-    #[test]
-    fn reads_pinned_toolchain_channel() {
-        let dir = std::env::temp_dir().join(format!(
-            "ro-sppack-toolchain-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .map(|duration| duration.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("rust-toolchain.toml"),
-            "[toolchain]\nchannel = \"nightly-2025-12-22\"\ncomponents = [\"miri\"]\n",
-        )
-        .unwrap();
-        assert_eq!(
-            read_toolchain_channel(&dir).as_deref(),
-            Some("nightly-2025-12-22")
-        );
-
-        let legacy = std::env::temp_dir().join("ro-sppack-toolchain-legacy");
-        std::fs::create_dir_all(&legacy).unwrap();
-        std::fs::write(legacy.join("rust-toolchain"), "nightly-2026-01-01\n").unwrap();
-        assert_eq!(
-            read_toolchain_channel(&legacy).as_deref(),
-            Some("nightly-2026-01-01")
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&legacy);
-    }
 
     #[test]
     fn install_plan_queues_one_translation_clone_and_apply() {

@@ -21,11 +21,9 @@ the client and the bots.
 
 - **Windows / Linux / macOS** (the launcher and the client build on all three).
 - **Git** on `PATH`.
-- **Rust toolchain installed via [rustup](https://rustup.rs)** — the server pins
-  a nightly toolchain, and the client and the bots pin the same recent stable
-  one, each in `rust-toolchain.toml`. Before each build the launcher runs
-  `rustup toolchain install <pinned-channel> --profile minimal` and then builds
-  with `cargo +<pinned-channel>`, so none of them needs to be your default.
+- **Rust toolchain installed via [rustup](https://rustup.rs)** — rust-ro, the
+  client and the bots all build with the stable toolchain, so the launcher runs
+  `cargo` with your default toolchain and does not install or switch any other.
 - A **Ragnarok Online client folder** (kRO or compatible) containing
   `DATA.INI` and the `.grf` archives. ro-sppack never downloads game assets;
   they are copyrighted by Gravity Co., Ltd.
