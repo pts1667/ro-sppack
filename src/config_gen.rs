@@ -109,6 +109,15 @@ fn generate_server_config(settings: &Settings) -> Result<(), String> {
     config["client_data"]["enabled"] = json!(true);
     config["client_data"]["host"] = json!(settings.server_host);
     config["client_data"]["port"] = json!(settings.client_data_port);
+    // The web client is served at `/` on the same port, from the folder its build writes. Empty
+    // serves nothing, which is also written while no build is there.
+    config["client_data"]["web_root"] = json!(if settings.serve_web_client
+        && settings.web_client_built()
+    {
+        settings.web_dist_dir().display().to_string()
+    } else {
+        String::new()
+    });
     config["bots"]["enabled"] = json!(settings.bot_api_enabled);
     config["bots"]["port"] = json!(settings.bot_api_port);
     // The bots plan their trips with the reference's `/db`.
@@ -341,6 +350,31 @@ mod tests {
         let written = std::fs::read_to_string(settings.server_config_json()).unwrap();
         let config: Value = serde_json::from_str(&written).unwrap();
         assert_eq!(config["bots"]["max_registered_bots"], json!(250));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_web_client_is_served_only_when_it_is_turned_on() {
+        let (root, mut settings) = install("web-root");
+        let web_root = |settings: &Settings| {
+            let written = std::fs::read_to_string(settings.server_config_json()).unwrap();
+            let config: Value = serde_json::from_str(&written).unwrap();
+            config["client_data"]["web_root"].clone()
+        };
+        generate_server(&settings).unwrap();
+        assert_eq!(web_root(&settings), json!(""));
+
+        // On, but nothing built yet: no folder that does not exist.
+        settings.serve_web_client = true;
+        generate_server(&settings).unwrap();
+        assert_eq!(web_root(&settings), json!(""));
+
+        let dist = settings.web_dist_dir();
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::write(dist.join("nostalro_bg.wasm"), b"").unwrap();
+        generate_server(&settings).unwrap();
+        assert_eq!(web_root(&settings), json!(dist.display().to_string()));
 
         std::fs::remove_dir_all(&root).ok();
     }

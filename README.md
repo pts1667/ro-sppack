@@ -24,6 +24,7 @@ the client and the bots.
 - **Rust toolchain installed via [rustup](https://rustup.rs)** — rust-ro, the
   client and the bots all build with the stable toolchain, so the launcher runs
   `cargo` with your default toolchain and does not install or switch any other.
+  The optional [web client](#web-client) also needs the `wasm32` target and `wasm-bindgen-cli`.
 - A **Ragnarok Online client folder** (kRO or compatible) containing
   `DATA.INI` and the `.grf` archives. ro-sppack never downloads game assets;
   they are copyrighted by Gravity Co., Ltd.
@@ -163,6 +164,34 @@ chat.
 - Changes apply the next time the server starts. **Refresh** looks for plugins
   again after you copy one into the folder.
 
+## Web client
+
+The client also builds for the browser. **Settings → General → Client data**
+has two options for it, both off by default:
+
+- **Build the web client** runs nostalro-client's `web/build.ps1` (Windows) or
+  `web/build.sh` during setup and updates, like the native client's build. It
+  writes the page and its wasm module to `nostalro-client/web/dist`. Once, install
+  what the build needs (the client pins `wasm-bindgen-cli` to 0.2.118):
+  ```bash
+  rustup target add wasm32-unknown-unknown
+  cargo install wasm-bindgen-cli --version 0.2.118 --locked
+  ```
+  The launcher does not install either. When one is missing, the build step
+  fails and its output is in the Logs tab. A copy of nostalro-client without the
+  web client (no `web/build.ps1` or `web/build.sh`) fails the step with
+  "not found" instead.
+- **Serve the web client at /** sets `client_data.web_root` in rust-ro's
+  `config.json` to that `web/dist` folder. The server then serves the page at
+  `/` on the client data port (`6903` by default), next to `/data`, so the page
+  and the game data come from the same origin. Off, or while `web/dist` holds no
+  built client, `web_root` is `""`, which serves nothing. It applies the next
+  time the server starts.
+
+Serving does not need the build option: a `web/dist` made by hand works too. The
+server does not compress the ~20 MB `.wasm`, so put a compressing proxy in front
+of it for players far from the server.
+
 ## Folder layout
 
 ```
@@ -170,6 +199,7 @@ chat.
   rust-ro/                    cloned server repository (config.json is regenerated)
     config/client-data/       game data the server serves on /data (built from the kRO archives)
   nostalro-client/            cloned native client repository
+    web/dist/                 web client build, when built (served at / with the web client option)
   rust-ro-bot/                cloned bot repository (state/ and cache/ hold the bots' memory and the reference cache; an update that brings a new server commit clears the cache)
     config.json               managed connection/data fields + your in-game settings
     data/
@@ -215,7 +245,8 @@ ro-sppack.exe --setup > setup.log 2>&1
   `game.sim_speed` (**Simulation speed**: game time per real time, 1 by default),
   `game.max_base_level` and `game.max_stat_level`,
 - `char_server.server_name` and `login.new_account` (**Registration**),
-- `client_data` (the `/data` endpoint: port 6903 by default, bound to the bind host),
+- `client_data` (the `/data` endpoint: port 6903 by default, bound to the bind host;
+  `web_root` is `web/dist` when [serving the web client](#web-client) and `""` otherwise),
 - `bots` (the bot API: enabled flag and port 6902 by default; with the API
   on, `max_bots` and `max_registered_bots` of at least twice the bot count),
 - `reference` (`/db` and `/wiki`, which the bots plan with: enabled, port 6904 by default),

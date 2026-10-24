@@ -117,6 +117,10 @@ pub struct Settings {
 
     /// Port of the server's client data endpoint (`/data`), the client's `data_url`.
     pub client_data_port: u16,
+    /// Build nostalro-client's web client (its `web/build.ps1` or `web/build.sh`) into `web/dist`.
+    pub build_web_client: bool,
+    /// Serve `web/dist` at `/` on the client data port (`client_data.web_root`).
+    pub serve_web_client: bool,
     /// Bot API (`/bots`), which lets an external program play characters.
     pub bot_api_enabled: bool,
     pub bot_api_port: u16,
@@ -209,6 +213,8 @@ impl Default for Settings {
             drop_rate_mvp: 1.0,
             mob_density: 1.0,
             client_data_port: 6903,
+            build_web_client: false,
+            serve_web_client: false,
             bot_api_enabled: true,
             bot_api_port: 6902,
             reference_port: 6904,
@@ -690,6 +696,15 @@ impl Settings {
 
     pub fn client_built(&self) -> bool {
         self.client_bin().is_file()
+    }
+
+    /// The web client's build output in nostalro-client; served at `/` when `serve_web_client` is on.
+    pub fn web_dist_dir(&self) -> PathBuf {
+        self.client_dir().join("web").join("dist")
+    }
+
+    pub fn web_client_built(&self) -> bool {
+        self.web_dist_dir().join("nostalro_bg.wasm").is_file()
     }
 
     pub fn bot_built(&self) -> bool {

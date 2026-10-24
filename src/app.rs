@@ -1146,6 +1146,26 @@ impl App {
                 .color(MUTED),
             );
             ui.add_space(4.0);
+            ui.checkbox(&mut self.settings.build_web_client, "Build the web client (browser version)")
+                .on_hover_text("Builds nostalro-client's web version into its web/dist folder during setup and updates, with the client's web/build.ps1 or web/build.sh. Needs the wasm32 target and wasm-bindgen-cli, see the README.");
+            ui.checkbox(&mut self.settings.serve_web_client, "Serve the web client at / on the client data port")
+                .on_hover_text("Sets client_data.web_root to web/dist, so a browser opens the game from the server's own address. Applies on the next server start.");
+            if self.settings.serve_web_client && !self.settings.web_client_built() {
+                ui.label(
+                    RichText::new(
+                        "Nothing is served yet: nostalro-client/web/dist has no web client. Build it, or build it by hand.",
+                    )
+                    .small()
+                    .color(MUTED),
+                );
+            }
+            ui.label(
+                RichText::new(
+                    "Both are off by default. Serving uses whatever is in nostalro-client/web/dist, so it works with a build made by hand too.",
+                )
+                .small()
+                .color(MUTED),
+            );
         });
 
         ui.add_space(8.0);

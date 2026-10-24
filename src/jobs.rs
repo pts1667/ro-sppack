@@ -37,6 +37,11 @@ pub enum JobKind {
         /// Optional `-p <package>` for workspace repositories.
         package: Option<String>,
     },
+    /// Run nostalro-client's `web/build.ps1` (or `web/build.sh`), which writes the browser build to
+    /// `web/dist`.
+    BuildWebClient {
+        dir: PathBuf,
+    },
     /// Run rust-ro's `client-data-setup` over a kRO client folder, writing the tree the server
     /// serves under `/data`.
     BuildClientData {
@@ -360,6 +365,37 @@ fn run_job(
             )
         }
 
+        JobKind::BuildWebClient { dir } => {
+            // The client's own script builds the wasm module, its glue and the page.
+            let script = if cfg!(windows) {
+                "web/build.ps1"
+            } else {
+                "web/build.sh"
+            };
+            if !dir.join(script).is_file() {
+                return Err(format!(
+                    "{script} not found in {}: this copy of nostalro-client has no web client",
+                    dir.display()
+                ));
+            }
+            let (program, args): (&str, Vec<String>) = if cfg!(windows) {
+                (
+                    "powershell",
+                    vec![
+                        "-NoProfile".into(),
+                        "-ExecutionPolicy".into(),
+                        "Bypass".into(),
+                        "-File".into(),
+                        script.into(),
+                    ],
+                )
+            } else {
+                ("sh", vec![script.into()])
+            };
+            let message = run_program(job.id, program, &args, dir, &[], tx, ctx, cancel, pid_slot)?;
+            Ok(format!("web client built: {message}"))
+        }
+
         JobKind::BuildClientData { source, server_dir } => {
             if !server_dir.join("Cargo.toml").is_file() {
                 return Err(format!(
@@ -639,6 +675,14 @@ fn plan(settings: &Settings, rebuild: bool, redo_data: bool) -> Vec<(String, Job
             },
         ));
     }
+    if have_client && settings.build_web_client && (rebuild || !settings.web_client_built()) {
+        plan.push((
+            "Build web client".to_string(),
+            JobKind::BuildWebClient {
+                dir: settings.client_dir(),
+            },
+        ));
+    }
     if have_bot && (rebuild || !settings.bot_built()) {
         plan.push((
             "Build rust-ro-bot".to_string(),
@@ -828,6 +872,25 @@ mod tests {
             !labels
                 .iter()
                 .any(|label| label.starts_with("Apply English"))
+        );
+    }
+
+    #[test]
+    fn the_web_client_is_built_only_when_it_is_turned_on() {
+        let queued = |settings: &Settings| {
+            install_plan(settings, true)
+                .iter()
+                .any(|(_, kind)| matches!(kind, JobKind::BuildWebClient { .. }))
+        };
+        let mut settings = Settings::default();
+        assert!(!queued(&settings));
+
+        settings.build_web_client = true;
+        assert!(queued(&settings));
+        assert!(
+            update_build_plan(&settings)
+                .iter()
+                .any(|(_, kind)| matches!(kind, JobKind::BuildWebClient { .. }))
         );
     }
 
